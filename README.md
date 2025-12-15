@@ -7,8 +7,8 @@ Test repository for homelab Kubernetes cluster CI/CD pipeline testing.
 | 🌐 Live Sites | 📦 Repos |
 |:--------------|:---------|
 | [🧪 Test (Prod)](https://test.epoch.engineering) | [🏠 Homelab Infra](https://github.com/EpochBoy/homelab) |
-| [🔬 Staging](https://staging.test.epoch.engineering) | |
-| [🧑‍💻 Dev](https://dev.test.epoch.engineering) | |
+| [🔬 Staging](https://test-staging.epoch.engineering) | |
+| [🧑‍💻 Dev](https://test-dev.epoch.engineering) | |
 
 ## Purpose
 
