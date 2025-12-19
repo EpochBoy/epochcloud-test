@@ -92,3 +92,4 @@ curl http://localhost:8080/version
 | `GET /version` | Version info (git commit, build time) |
 | `GET /` | Welcome page |
 # Webhook Test 1766154006
+# IngressRoute Fixed 1766154234
