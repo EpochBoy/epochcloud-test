@@ -92,3 +92,4 @@ curl http://localhost:8080/version
 | `GET /version` | Version info (git commit, build time) |
 | `GET /` | Welcome page |
 # CI Test Fri Dec 26 18:07:17 CET 2025
+# Trigger rebuild - 20251227123201
