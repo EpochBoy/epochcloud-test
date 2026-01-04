@@ -7,6 +7,10 @@ import (
 	"net/http"
 	"os"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 var (
@@ -14,6 +18,34 @@ var (
 	Version   = "dev"
 	Commit    = "unknown"
 	BuildTime = "unknown"
+)
+
+// Prometheus metrics
+var (
+	httpRequestsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "epochcloud_http_requests_total",
+			Help: "Total number of HTTP requests",
+		},
+		[]string{"method", "path", "status"},
+	)
+
+	httpRequestDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "epochcloud_http_request_duration_seconds",
+			Help:    "HTTP request duration in seconds",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"method", "path"},
+	)
+
+	appInfo = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "epochcloud_app_info",
+			Help: "Application build information",
+		},
+		[]string{"version", "commit", "build_time", "environment"},
+	)
 )
 
 type HealthResponse struct {
@@ -275,17 +307,51 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 	tmpl.Execute(w, data)
 }
 
+// metricsMiddleware wraps handlers to record metrics
+func metricsMiddleware(path string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+
+		// Wrap ResponseWriter to capture status code
+		wrapped := &statusRecorder{ResponseWriter: w, statusCode: http.StatusOK}
+		next(wrapped, r)
+
+		duration := time.Since(start).Seconds()
+		httpRequestsTotal.WithLabelValues(r.Method, path, http.StatusText(wrapped.statusCode)).Inc()
+		httpRequestDuration.WithLabelValues(r.Method, path).Observe(duration)
+	}
+}
+
+// statusRecorder wraps http.ResponseWriter to capture the status code
+type statusRecorder struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.statusCode = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 
-	http.HandleFunc("/", rootHandler)
-	http.HandleFunc("/health", healthHandler)
-	http.HandleFunc("/version", versionHandler)
+	// Record build info metric
+	appInfo.WithLabelValues(Version, Commit, BuildTime, getEnvironment()).Set(1)
+
+	// Application endpoints with metrics middleware
+	http.HandleFunc("/", metricsMiddleware("/", rootHandler))
+	http.HandleFunc("/health", metricsMiddleware("/health", healthHandler))
+	http.HandleFunc("/version", metricsMiddleware("/version", versionHandler))
+
+	// Prometheus metrics endpoint (not wrapped to avoid recursive metrics)
+	http.Handle("/metrics", promhttp.Handler())
 
 	log.Printf("Starting epochcloud-test v%s on port %s", Version, port)
+	log.Printf("Metrics available at /metrics")
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 // test-1766232964

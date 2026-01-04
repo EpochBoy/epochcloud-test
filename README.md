@@ -89,4 +89,26 @@ curl http://localhost:8080/version
 | -------- | ----------- |
 | `GET /health` | Health check (for probes) |
 | `GET /version` | Version info (git commit, build time) |
+| `GET /metrics` | Prometheus metrics (scraped automatically) |
 | `GET /` | Welcome page |
+
+## Observability
+
+This app demonstrates full observability integration with the EpochCloud platform:
+
+### Prometheus Metrics
+
+The `/metrics` endpoint exposes:
+
+| Metric | Type | Description |
+| ------ | ---- | ----------- |
+| `epochcloud_http_requests_total` | Counter | Total HTTP requests by method, path, and status |
+| `epochcloud_http_request_duration_seconds` | Histogram | Request latency distribution (p50, p95, p99) |
+| `epochcloud_app_info` | Gauge | App metadata (version, commit, start time) |
+
+### Platform Integration
+
+- **PodMonitor** auto-discovers all pods with `app.kubernetes.io/part-of: epochcloud` label
+- **Grafana Dashboard** shows request rates, latency percentiles, and running instances
+- **Promtail** collects logs → **Loki** for aggregation
+- **Tempo** for distributed tracing (OTLP instrumentation ready)
