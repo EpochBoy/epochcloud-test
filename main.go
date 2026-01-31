@@ -49,6 +49,9 @@ var (
 	rabbitChannel *amqp.Channel
 	rabbitMu      sync.RWMutex
 	rabbitEnabled bool
+	// Consumer mode - when true, only consume messages (no HTTP server except /health and /metrics)
+	// Used by KEDA-scaled consumer pods
+	consumerMode bool
 	// Stores last N consumed messages for demo display
 	consumedMessages     []ConsumedMessage
 	consumedMessagesMu   sync.RWMutex
@@ -734,11 +737,19 @@ func rabbitConnectionManager(ctx context.Context) {
 		logger.Info("RabbitMQ connected",
 			slog.String("host", host),
 			slog.String("vhost", vhost),
+			slog.Bool("consumer_mode", consumerMode),
 		)
 
-		// Start consumer for this connection
-		consumerCtx, consumerCancel := context.WithCancel(ctx)
-		go startConsumer(consumerCtx)
+		// Only start consumer if in consumer mode
+		// This allows producer and consumer to be separate deployments
+		var consumerCancel context.CancelFunc
+		if consumerMode {
+			var consumerCtx context.Context
+			consumerCtx, consumerCancel = context.WithCancel(ctx)
+			go startConsumer(consumerCtx)
+		} else {
+			consumerCancel = func() {} // no-op
+		}
 
 		// Wait for connection close notification
 		closeChan := make(chan *amqp.Error, 1)
@@ -1010,6 +1021,12 @@ func closeRabbitMQ() {
 func main() {
 	initLogger()
 
+	// Check if running in consumer-only mode (for KEDA scaling)
+	consumerMode = os.Getenv("CONSUMER_MODE") == "true"
+	if consumerMode {
+		logger.Info("starting in CONSUMER mode - HTTP server disabled, consuming only")
+	}
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -1037,14 +1054,19 @@ func main() {
 	appInfo.WithLabelValues(Version, Commit, BuildTime, getEnvironment()).Set(1)
 
 	mux := http.NewServeMux()
-	mux.Handle("/", metricsMiddleware("/", rootHandler))
+	// Always register health and metrics for probes and monitoring
 	mux.Handle("/health", metricsMiddleware("/health", healthHandler))
-	mux.Handle("/version", metricsMiddleware("/version", versionHandler))
-	mux.Handle("/chaos", metricsMiddleware("/chaos", chaosHandler))
-	// RabbitMQ demo endpoints
-	mux.Handle("/rabbitmq/status", metricsMiddleware("/rabbitmq/status", rabbitStatusHandler))
-	mux.Handle("/rabbitmq/publish", metricsMiddleware("/rabbitmq/publish", rabbitPublishHandler))
 	mux.Handle("/metrics", promhttp.Handler())
+
+	if !consumerMode {
+		// Full HTTP API only in producer mode
+		mux.Handle("/", metricsMiddleware("/", rootHandler))
+		mux.Handle("/version", metricsMiddleware("/version", versionHandler))
+		mux.Handle("/chaos", metricsMiddleware("/chaos", chaosHandler))
+		// RabbitMQ demo endpoints
+		mux.Handle("/rabbitmq/status", metricsMiddleware("/rabbitmq/status", rabbitStatusHandler))
+		mux.Handle("/rabbitmq/publish", metricsMiddleware("/rabbitmq/publish", rabbitPublishHandler))
+	}
 
 	server := &http.Server{
 		Addr:         ":" + port,
