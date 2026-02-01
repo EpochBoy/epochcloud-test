@@ -14,6 +14,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+
 	amqp "github.com/rabbitmq/amqp091-go"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -42,6 +44,13 @@ var logger *slog.Logger
 
 // Tracer - OpenTelemetry tracer for Tempo
 var tracer trace.Tracer
+
+// Valkey/Redis client
+var (
+	valkeyClient  *redis.Client
+	valkeyMu      sync.RWMutex
+	valkeyEnabled bool
+)
 
 // RabbitMQ connection and channel
 var (
@@ -135,6 +144,36 @@ var (
 		prometheus.GaugeOpts{
 			Name: "epochcloud_rabbitmq_connected",
 			Help: "RabbitMQ connection status (1=connected, 0=disconnected)",
+		},
+	)
+
+	// Valkey/Redis metrics
+	valkeyCacheHits = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "epochcloud_valkey_cache_hits_total",
+			Help: "Total number of Valkey cache hits",
+		},
+	)
+
+	valkeyCacheMisses = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "epochcloud_valkey_cache_misses_total",
+			Help: "Total number of Valkey cache misses",
+		},
+	)
+
+	valkeyOperations = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "epochcloud_valkey_operations_total",
+			Help: "Total number of Valkey operations by type",
+		},
+		[]string{"operation"},
+	)
+
+	valkeyConnectionStatus = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "epochcloud_valkey_connected",
+			Help: "Valkey connection status (1=connected, 0=disconnected)",
 		},
 	)
 )
@@ -1018,6 +1057,312 @@ func closeRabbitMQ() {
 	logger.Info("RabbitMQ connections closed")
 }
 
+// initValkey initializes the Valkey/Redis client
+func initValkey() {
+	host := os.Getenv("VALKEY_HOST")
+	port := os.Getenv("VALKEY_PORT")
+	password := os.Getenv("VALKEY_PASSWORD")
+	dbStr := os.Getenv("VALKEY_DATABASE")
+
+	if host == "" {
+		logger.Info("VALKEY_HOST not set, Valkey disabled")
+		return
+	}
+
+	db := 0
+	if dbStr != "" {
+		if parsed, err := strconv.Atoi(dbStr); err == nil {
+			db = parsed
+		}
+	}
+
+	if port == "" {
+		port = "6379"
+	}
+
+	addr := fmt.Sprintf("%s:%s", host, port)
+
+	client := redis.NewClient(&redis.Options{
+		Addr:     addr,
+		Password: password,
+		DB:       db,
+	})
+
+	// Test connection
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := client.Ping(ctx).Err(); err != nil {
+		logger.Warn("failed to connect to Valkey",
+			slog.String("addr", addr),
+			slog.Int("db", db),
+			slog.String("error", err.Error()),
+		)
+		valkeyConnectionStatus.Set(0)
+		return
+	}
+
+	valkeyMu.Lock()
+	valkeyClient = client
+	valkeyEnabled = true
+	valkeyMu.Unlock()
+
+	valkeyConnectionStatus.Set(1)
+	logger.Info("Valkey connected",
+		slog.String("addr", addr),
+		slog.Int("db", db),
+	)
+}
+
+// closeValkey closes the Valkey connection
+func closeValkey() {
+	valkeyMu.Lock()
+	defer valkeyMu.Unlock()
+
+	if valkeyClient != nil {
+		valkeyClient.Close()
+		valkeyClient = nil
+	}
+	valkeyEnabled = false
+	valkeyConnectionStatus.Set(0)
+	logger.Info("Valkey connection closed")
+}
+
+// ValkeyResponse for cache API responses
+type ValkeyResponse struct {
+	Success   bool   `json:"success"`
+	Operation string `json:"operation,omitempty"`
+	Key       string `json:"key,omitempty"`
+	Value     string `json:"value,omitempty"`
+	Hit       bool   `json:"hit,omitempty"`
+	Message   string `json:"message,omitempty"`
+	Connected bool   `json:"connected"`
+	TraceID   string `json:"trace_id,omitempty"`
+	Timestamp string `json:"timestamp"`
+}
+
+// valkeyStatusHandler returns Valkey connection status
+func valkeyStatusHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_, span := tracer.Start(ctx, "valkeyStatus")
+	defer span.End()
+
+	valkeyMu.RLock()
+	client := valkeyClient
+	enabled := valkeyEnabled
+	valkeyMu.RUnlock()
+
+	connected := false
+	if enabled && client != nil {
+		pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		if err := client.Ping(pingCtx).Err(); err == nil {
+			connected = true
+		}
+	}
+
+	if connected {
+		valkeyConnectionStatus.Set(1)
+	} else {
+		valkeyConnectionStatus.Set(0)
+	}
+
+	resp := ValkeyResponse{
+		Success:   connected,
+		Message:   fmt.Sprintf("Valkey enabled=%v, connected=%v", enabled, connected),
+		Connected: connected,
+		TraceID:   span.SpanContext().TraceID().String(),
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// valkeySetHandler sets a key-value pair in Valkey
+func valkeySetHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_, span := tracer.Start(ctx, "valkeySet")
+	defer span.End()
+
+	valkeyMu.RLock()
+	client := valkeyClient
+	enabled := valkeyEnabled
+	valkeyMu.RUnlock()
+
+	if !enabled || client == nil {
+		resp := ValkeyResponse{
+			Success:   false,
+			Message:   "Valkey not connected",
+			Connected: false,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	key := r.URL.Query().Get("key")
+	value := r.URL.Query().Get("value")
+	ttlStr := r.URL.Query().Get("ttl")
+
+	if key == "" {
+		key = "demo-key"
+	}
+	if value == "" {
+		value = fmt.Sprintf("demo-value-%d", time.Now().Unix())
+	}
+
+	ttl := 5 * time.Minute
+	if ttlStr != "" {
+		if seconds, err := strconv.Atoi(ttlStr); err == nil {
+			ttl = time.Duration(seconds) * time.Second
+		}
+	}
+
+	traceID := span.SpanContext().TraceID().String()
+
+	err := client.Set(ctx, key, value, ttl).Err()
+	if err != nil {
+		logger.ErrorContext(ctx, "failed to set key in Valkey",
+			slog.String("key", key),
+			slog.String("error", err.Error()),
+			slog.String("trace_id", traceID),
+		)
+		resp := ValkeyResponse{
+			Success:   false,
+			Operation: "SET",
+			Key:       key,
+			Message:   "Failed to set: " + err.Error(),
+			Connected: true,
+			TraceID:   traceID,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	valkeyOperations.WithLabelValues("set").Inc()
+	logger.InfoContext(ctx, "key set in Valkey",
+		slog.String("key", key),
+		slog.Duration("ttl", ttl),
+		slog.String("trace_id", traceID),
+	)
+
+	resp := ValkeyResponse{
+		Success:   true,
+		Operation: "SET",
+		Key:       key,
+		Value:     value,
+		Message:   fmt.Sprintf("Set key '%s' with TTL %v", key, ttl),
+		Connected: true,
+		TraceID:   traceID,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// valkeyGetHandler gets a value from Valkey
+func valkeyGetHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_, span := tracer.Start(ctx, "valkeyGet")
+	defer span.End()
+
+	valkeyMu.RLock()
+	client := valkeyClient
+	enabled := valkeyEnabled
+	valkeyMu.RUnlock()
+
+	if !enabled || client == nil {
+		resp := ValkeyResponse{
+			Success:   false,
+			Message:   "Valkey not connected",
+			Connected: false,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	key := r.URL.Query().Get("key")
+	if key == "" {
+		key = "demo-key"
+	}
+
+	traceID := span.SpanContext().TraceID().String()
+
+	value, err := client.Get(ctx, key).Result()
+	if err == redis.Nil {
+		// Cache miss
+		valkeyCacheMisses.Inc()
+		valkeyOperations.WithLabelValues("get").Inc()
+		logger.InfoContext(ctx, "cache miss",
+			slog.String("key", key),
+			slog.String("trace_id", traceID),
+		)
+		resp := ValkeyResponse{
+			Success:   true,
+			Operation: "GET",
+			Key:       key,
+			Hit:       false,
+			Message:   fmt.Sprintf("Key '%s' not found (cache miss)", key),
+			Connected: true,
+			TraceID:   traceID,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+		return
+	} else if err != nil {
+		logger.ErrorContext(ctx, "failed to get key from Valkey",
+			slog.String("key", key),
+			slog.String("error", err.Error()),
+			slog.String("trace_id", traceID),
+		)
+		resp := ValkeyResponse{
+			Success:   false,
+			Operation: "GET",
+			Key:       key,
+			Message:   "Failed to get: " + err.Error(),
+			Connected: true,
+			TraceID:   traceID,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	// Cache hit
+	valkeyCacheHits.Inc()
+	valkeyOperations.WithLabelValues("get").Inc()
+	logger.InfoContext(ctx, "cache hit",
+		slog.String("key", key),
+		slog.String("trace_id", traceID),
+	)
+
+	resp := ValkeyResponse{
+		Success:   true,
+		Operation: "GET",
+		Key:       key,
+		Value:     value,
+		Hit:       true,
+		Message:   fmt.Sprintf("Key '%s' found (cache hit)", key),
+		Connected: true,
+		TraceID:   traceID,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
 func main() {
 	initLogger()
 
@@ -1051,6 +1396,10 @@ func main() {
 	initRabbitMQ(ctx)
 	defer closeRabbitMQ()
 
+	// Initialize Valkey/Redis connection
+	initValkey()
+	defer closeValkey()
+
 	appInfo.WithLabelValues(Version, Commit, BuildTime, getEnvironment()).Set(1)
 
 	mux := http.NewServeMux()
@@ -1066,6 +1415,10 @@ func main() {
 		// RabbitMQ demo endpoints
 		mux.Handle("/rabbitmq/status", metricsMiddleware("/rabbitmq/status", rabbitStatusHandler))
 		mux.Handle("/rabbitmq/publish", metricsMiddleware("/rabbitmq/publish", rabbitPublishHandler))
+		// Valkey/Redis cache demo endpoints
+		mux.Handle("/cache/status", metricsMiddleware("/cache/status", valkeyStatusHandler))
+		mux.Handle("/cache/set", metricsMiddleware("/cache/set", valkeySetHandler))
+		mux.Handle("/cache/get", metricsMiddleware("/cache/get", valkeyGetHandler))
 	}
 
 	server := &http.Server{
