@@ -52,6 +52,13 @@ var (
 	valkeyEnabled bool
 )
 
+// DefectDojo API client
+var (
+	defectdojoURL     string
+	defectdojoToken   string
+	defectdojoEnabled bool
+)
+
 // RabbitMQ connection and channel
 var (
 	rabbitConn    *amqp.Connection
@@ -174,6 +181,22 @@ var (
 		prometheus.GaugeOpts{
 			Name: "epochcloud_valkey_connected",
 			Help: "Valkey connection status (1=connected, 0=disconnected)",
+		},
+	)
+
+	// DefectDojo metrics
+	defectdojoAPIRequests = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "epochcloud_defectdojo_api_requests_total",
+			Help: "Total DefectDojo API requests by endpoint and status",
+		},
+		[]string{"endpoint", "status"},
+	)
+
+	defectdojoConnectionStatus = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "epochcloud_defectdojo_connected",
+			Help: "DefectDojo connection status (1=connected, 0=disconnected)",
 		},
 	)
 )
@@ -364,6 +387,14 @@ const pageTemplate = `<!DOCTYPE html>
                 <div class="info-item"><label>/chaos?action=slow</label><p>Adds 2s latency for latency alerts</p></div>
                 <div class="info-item"><label>/chaos?action=load&count=50</label><p>Simulates N concurrent requests</p></div>
             </div>
+        </div>
+        <div class="card">
+            <h2>🛡️ DefectDojo Security</h2>
+            <p style="color: #888; margin-bottom: 1rem;">Vulnerability management integration — tracks products &amp; findings:</p>
+            <div class="info-grid">
+                <div class="info-item"><label>/defectdojo/status</label><p>Connection status, products &amp; findings summary</p></div>
+            </div>
+            <p style="color: #666; margin-top: 1rem; font-size: 0.8rem;">API token provisioned by setup-postsync. View metrics: epochcloud_defectdojo_*</p>
         </div>
         <div class="footer">
             <p>Last refreshed: {{.Timestamp}}</p>
@@ -1383,6 +1414,234 @@ func valkeyGetHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+// DefectDojo API response types
+type DefectDojoProductsResponse struct {
+	Count   int                 `json:"count"`
+	Results []DefectDojoProduct `json:"results"`
+}
+
+type DefectDojoProduct struct {
+	ID          int    `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
+type DefectDojoFindingsResponse struct {
+	Count   int                  `json:"count"`
+	Results []DefectDojoFinding  `json:"results"`
+}
+
+type DefectDojoFinding struct {
+	ID       int    `json:"id"`
+	Title    string `json:"title"`
+	Severity string `json:"severity"`
+	Active   bool   `json:"active"`
+	Verified bool   `json:"verified"`
+}
+
+type DefectDojoFindingsSummary struct {
+	Total      int            `json:"total"`
+	BySeverity map[string]int `json:"by_severity"`
+}
+
+type DefectDojoStatusResponse struct {
+	Connected       bool                       `json:"connected"`
+	URL             string                     `json:"url,omitempty"`
+	Products        []DefectDojoProduct        `json:"products,omitempty"`
+	ProductCount    int                        `json:"product_count"`
+	FindingsSummary *DefectDojoFindingsSummary  `json:"findings_summary,omitempty"`
+	Message         string                     `json:"message"`
+	TraceID         string                     `json:"trace_id,omitempty"`
+	Timestamp       string                     `json:"timestamp"`
+}
+
+// initDefectDojo checks for DefectDojo configuration and verifies connectivity
+func initDefectDojo() {
+	defectdojoURL = os.Getenv("DEFECTDOJO_URL")
+	defectdojoToken = os.Getenv("DEFECTDOJO_TOKEN")
+
+	if defectdojoURL == "" || defectdojoToken == "" {
+		logger.Info("DefectDojo not configured, skipping initialization",
+			slog.Bool("url_set", defectdojoURL != ""),
+			slog.Bool("token_set", defectdojoToken != ""),
+		)
+		defectdojoConnectionStatus.Set(0)
+		return
+	}
+
+	// Verify connectivity with a lightweight API call
+	client := &http.Client{Timeout: 5 * time.Second}
+	req, err := http.NewRequest("GET", defectdojoURL+"/api/v2/products/?limit=1", nil)
+	if err != nil {
+		logger.Warn("DefectDojo request creation failed", slog.String("error", err.Error()))
+		defectdojoConnectionStatus.Set(0)
+		defectdojoEnabled = true // Enable anyway — will retry on request
+		return
+	}
+	req.Header.Set("Authorization", "Token "+defectdojoToken)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		logger.Warn("DefectDojo connectivity check failed, will retry on request",
+			slog.String("url", defectdojoURL),
+			slog.String("error", err.Error()),
+		)
+		defectdojoConnectionStatus.Set(0)
+		defectdojoEnabled = true
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 200 {
+		defectdojoEnabled = true
+		defectdojoConnectionStatus.Set(1)
+		logger.Info("DefectDojo connected", slog.String("url", defectdojoURL))
+	} else {
+		defectdojoEnabled = true
+		defectdojoConnectionStatus.Set(0)
+		logger.Warn("DefectDojo returned non-200",
+			slog.String("url", defectdojoURL),
+			slog.Int("status", resp.StatusCode),
+		)
+	}
+}
+
+// defectdojoAPIGet makes an authenticated GET request to the DefectDojo API
+func defectdojoAPIGet(ctx context.Context, client *http.Client, path string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", defectdojoURL+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Token "+defectdojoToken)
+	req.Header.Set("Accept", "application/json")
+	return client.Do(req)
+}
+
+// defectdojoStatusHandler returns DefectDojo connection status, products, and findings summary
+func defectdojoStatusHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_, span := tracer.Start(ctx, "defectdojoStatus")
+	defer span.End()
+
+	traceID := span.SpanContext().TraceID().String()
+
+	if !defectdojoEnabled {
+		resp := DefectDojoStatusResponse{
+			Connected: false,
+			Message:   "DefectDojo not configured (DEFECTDOJO_URL or DEFECTDOJO_TOKEN not set)",
+			TraceID:   traceID,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	// Fetch products
+	prodResp, err := defectdojoAPIGet(ctx, client, "/api/v2/products/?limit=50")
+	if err != nil {
+		defectdojoConnectionStatus.Set(0)
+		defectdojoAPIRequests.WithLabelValues("products", "error").Inc()
+		logger.ErrorContext(ctx, "DefectDojo products request failed",
+			slog.String("error", err.Error()),
+			slog.String("trace_id", traceID),
+		)
+		resp := DefectDojoStatusResponse{
+			Connected: false,
+			URL:       defectdojoURL,
+			Message:   "Failed to connect: " + err.Error(),
+			TraceID:   traceID,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+	defer prodResp.Body.Close()
+
+	if prodResp.StatusCode != 200 {
+		defectdojoConnectionStatus.Set(0)
+		defectdojoAPIRequests.WithLabelValues("products", "error").Inc()
+		resp := DefectDojoStatusResponse{
+			Connected: false,
+			URL:       defectdojoURL,
+			Message:   fmt.Sprintf("DefectDojo API returned %d", prodResp.StatusCode),
+			TraceID:   traceID,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	var products DefectDojoProductsResponse
+	if err := json.NewDecoder(prodResp.Body).Decode(&products); err != nil {
+		defectdojoAPIRequests.WithLabelValues("products", "error").Inc()
+		resp := DefectDojoStatusResponse{
+			Connected: false,
+			URL:       defectdojoURL,
+			Message:   "Failed to decode products: " + err.Error(),
+			TraceID:   traceID,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+	defectdojoAPIRequests.WithLabelValues("products", "success").Inc()
+
+	// Fetch active findings summary
+	var summary *DefectDojoFindingsSummary
+	findResp, err := defectdojoAPIGet(ctx, client, "/api/v2/findings/?active=true&limit=100")
+	if err == nil {
+		defer findResp.Body.Close()
+		if findResp.StatusCode == 200 {
+			var findings DefectDojoFindingsResponse
+			if err := json.NewDecoder(findResp.Body).Decode(&findings); err == nil {
+				defectdojoAPIRequests.WithLabelValues("findings", "success").Inc()
+				bySeverity := make(map[string]int)
+				for _, f := range findings.Results {
+					bySeverity[f.Severity]++
+				}
+				summary = &DefectDojoFindingsSummary{
+					Total:      findings.Count,
+					BySeverity: bySeverity,
+				}
+			}
+		}
+	}
+	if summary == nil {
+		defectdojoAPIRequests.WithLabelValues("findings", "error").Inc()
+	}
+
+	defectdojoConnectionStatus.Set(1)
+
+	logger.InfoContext(ctx, "DefectDojo status check",
+		slog.Int("products", products.Count),
+		slog.String("trace_id", traceID),
+	)
+
+	statusResp := DefectDojoStatusResponse{
+		Connected:       true,
+		URL:             defectdojoURL,
+		Products:        products.Results,
+		ProductCount:    products.Count,
+		FindingsSummary: summary,
+		Message:         "DefectDojo connected",
+		TraceID:         traceID,
+		Timestamp:       time.Now().UTC().Format(time.RFC3339),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(statusResp)
+}
+
 func main() {
 	initLogger()
 
@@ -1420,6 +1679,9 @@ func main() {
 	initValkey()
 	defer closeValkey()
 
+	// Initialize DefectDojo API client
+	initDefectDojo()
+
 	appInfo.WithLabelValues(Version, Commit, BuildTime, getEnvironment()).Set(1)
 
 	mux := http.NewServeMux()
@@ -1439,6 +1701,8 @@ func main() {
 		mux.Handle("/cache/status", metricsMiddleware("/cache/status", valkeyStatusHandler))
 		mux.Handle("/cache/set", metricsMiddleware("/cache/set", valkeySetHandler))
 		mux.Handle("/cache/get", metricsMiddleware("/cache/get", valkeyGetHandler))
+		// DefectDojo security demo endpoint
+		mux.Handle("/defectdojo/status", metricsMiddleware("/defectdojo/status", defectdojoStatusHandler))
 	}
 
 	server := &http.Server{
