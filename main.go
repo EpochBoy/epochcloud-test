@@ -74,6 +74,12 @@ var (
 	maxConsumedMessages  = 10
 )
 
+// Rybbit analytics
+var (
+	rybbitSiteID string
+	rybbitHost   string
+)
+
 // ConsumedMessage holds a consumed message for display
 type ConsumedMessage struct {
 	Body      string    `json:"body"`
@@ -215,12 +221,14 @@ type VersionResponse struct {
 }
 
 type PageData struct {
-	Version     string
-	Commit      string
-	BuildTime   string
-	Hostname    string
-	Environment string
-	Timestamp   string
+	Version      string
+	Commit       string
+	BuildTime    string
+	Hostname     string
+	Environment  string
+	Timestamp    string
+	RybbitSiteID string
+	RybbitHost   string
 }
 
 const pageTemplate = `<!DOCTYPE html>
@@ -327,6 +335,7 @@ const pageTemplate = `<!DOCTYPE html>
         .footer { text-align: center; margin-top: 2rem; font-size: 0.85rem; color: #666; }
         .footer a { color: #00d9ff; text-decoration: none; }
     </style>
+    {{if and .RybbitSiteID .RybbitHost}}<script src="{{.RybbitHost}}/script.js" data-site-id="{{.RybbitSiteID}}" defer></script>{{end}}
 </head>
 <body>
     <div class="container">
@@ -518,12 +527,14 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 
 	hostname, _ := os.Hostname()
 	data := PageData{
-		Version:     Version,
-		Commit:      Commit,
-		BuildTime:   BuildTime,
-		Hostname:    hostname,
-		Environment: getEnvironment(),
-		Timestamp:   time.Now().UTC().Format(time.RFC3339),
+		Version:      Version,
+		Commit:       Commit,
+		BuildTime:    BuildTime,
+		Hostname:     hostname,
+		Environment:  getEnvironment(),
+		Timestamp:    time.Now().UTC().Format(time.RFC3339),
+		RybbitSiteID: rybbitSiteID,
+		RybbitHost:   rybbitHost,
 	}
 
 	tmpl, err := template.New("page").Parse(pageTemplate)
@@ -1681,6 +1692,10 @@ func main() {
 
 	// Initialize DefectDojo API client
 	initDefectDojo()
+
+	// Initialize Rybbit analytics config
+	rybbitSiteID = os.Getenv("RYBBIT_SITE_ID")
+	rybbitHost = os.Getenv("RYBBIT_HOST")
 
 	appInfo.WithLabelValues(Version, Commit, BuildTime, getEnvironment()).Set(1)
 
