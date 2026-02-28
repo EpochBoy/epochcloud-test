@@ -360,7 +360,9 @@ const pageTemplate = `<!DOCTYPE html>
                 <div class="obs-item"><div class="icon">📈</div><div class="label">Prometheus</div><div class="desc">Metrics at /metrics</div></div>
                 <div class="obs-item"><div class="icon">📋</div><div class="label">Loki</div><div class="desc">JSON structured logs</div></div>
                 <div class="obs-item"><div class="icon">🔍</div><div class="label">Tempo</div><div class="desc">Distributed tracing</div></div>
-                <div class="obs-item"><div class="icon">��</div><div class="label">AlertManager</div><div class="desc">Error rate alerts</div></div>
+                <div class="obs-item"><div class="icon">🔔</div><div class="label">AlertManager</div><div class="desc">Error rate alerts</div></div>
+                <div class="obs-item"><div class="icon">🦅</div><div class="label">Falco</div><div class="desc">Runtime security</div></div>
+                <div class="obs-item"><div class="icon">📊</div><div class="label">Rybbit</div><div class="desc">Web analytics</div></div>
             </div>
         </div>
         <div class="card">
@@ -404,6 +406,29 @@ const pageTemplate = `<!DOCTYPE html>
                 <div class="info-item"><label>/defectdojo/status</label><p>Connection status, products &amp; findings summary</p></div>
             </div>
             <p style="color: #666; margin-top: 1rem; font-size: 0.8rem;">API token provisioned by setup-postsync. View metrics: epochcloud_defectdojo_*</p>
+        </div>
+        <div class="card">
+            <h2>⚡ Knative Serverless</h2>
+            <p style="color: #888; margin-bottom: 1rem;">Scale-to-zero serverless workloads with Knative Serving:</p>
+            <div class="info-grid">
+                <div class="info-item"><label>Autoscaler</label><p>Request-driven KPA with scale-to-zero</p></div>
+                <div class="info-item"><label>Networking</label><p>Kourier (Envoy) internal ingress</p></div>
+                <div class="info-item"><label>Revisions</label><p>Immutable snapshots with traffic splitting</p></div>
+                <div class="info-item"><label>Service Mesh</label><p>Linkerd mTLS on all workloads</p></div>
+            </div>
+            <p style="color: #666; margin-top: 1rem; font-size: 0.8rem;">Functions deploy as Knative Services with automatic scale-to-zero after idle.</p>
+        </div>
+        <div class="card">
+            <h2>🏗️ Infrastructure Stack</h2>
+            <p style="color: #888; margin-bottom: 1rem;">Full self-hosted Kubernetes platform on Proxmox VE:</p>
+            <div class="observability">
+                <div class="obs-item"><div class="icon">☸️</div><div class="label">Talos OS</div><div class="desc">Immutable Linux</div></div>
+                <div class="obs-item"><div class="icon">🔒</div><div class="label">Linkerd</div><div class="desc">mTLS mesh</div></div>
+                <div class="obs-item"><div class="icon">🐝</div><div class="label">Cilium</div><div class="desc">eBPF networking</div></div>
+                <div class="obs-item"><div class="icon">🔑</div><div class="label">Keycloak</div><div class="desc">SSO/OIDC</div></div>
+                <div class="obs-item"><div class="icon">🗄️</div><div class="label">Harbor</div><div class="desc">Registry</div></div>
+                <div class="obs-item"><div class="icon">🛡️</div><div class="label">CrowdSec</div><div class="desc">Threat intel</div></div>
+            </div>
         </div>
         <div class="footer">
             <p>Last refreshed: {{.Timestamp}}</p>
