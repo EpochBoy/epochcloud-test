@@ -273,6 +273,27 @@ const pageTemplate = `<!DOCTYPE html>
         .env-dev { background: #ff6b6b; color: #fff; }
         .env-staging { background: #feca57; color: #1a1a2e; }
         .env-prod { background: #00d26a; color: #fff; }
+        .stage-nav {
+            display: flex;
+            justify-content: center;
+            gap: 0.5rem;
+            margin-top: 1rem;
+        }
+        .stage-pill {
+            display: inline-block;
+            padding: 0.4rem 1.2rem;
+            border-radius: 50px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            font-size: 0.85rem;
+            text-decoration: none;
+            opacity: 0.4;
+            transition: opacity 0.2s, transform 0.2s;
+            cursor: pointer;
+        }
+        .stage-pill:hover { opacity: 0.8; transform: scale(1.05); }
+        .stage-pill.active { opacity: 1; cursor: default; transform: none; box-shadow: 0 0 12px rgba(255,255,255,0.2); }
         .card {
             background: rgba(255, 255, 255, 0.05);
             backdrop-filter: blur(10px);
@@ -343,6 +364,30 @@ const pageTemplate = `<!DOCTYPE html>
             <h1>🚀 EpochCloud Test</h1>
             <p>GitOps proof-of-concept demonstrating the full CI/CD pipeline</p>
             <span class="env-badge env-{{.Environment}}">{{.Environment}}</span>
+            <div class="stage-nav" id="stage-nav"></div>
+            <script>
+                (function() {
+                    var env = '{{.Environment}}';
+                    var host = window.location.hostname;
+                    // Extract base domain: remove test-dev./test-staging./test. prefix
+                    var domain = host.replace(/^test-(dev|staging)\./, '').replace(/^test\./, '');
+                    var stages = [
+                        {name: 'dev', prefix: 'test-dev', cls: 'env-dev'},
+                        {name: 'staging', prefix: 'test-staging', cls: 'env-staging'},
+                        {name: 'prod', prefix: 'test', cls: 'env-prod'}
+                    ];
+                    var nav = document.getElementById('stage-nav');
+                    stages.forEach(function(s) {
+                        var a = document.createElement('a');
+                        a.className = 'stage-pill ' + s.cls + (env === s.name ? ' active' : '');
+                        a.textContent = s.name;
+                        if (env !== s.name) {
+                            a.href = window.location.protocol + '//' + s.prefix + '.' + domain + window.location.pathname;
+                        }
+                        nav.appendChild(a);
+                    });
+                })();
+            </script>
         </div>
         <div class="card">
             <h2>📦 Build Information</h2>
