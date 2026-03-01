@@ -90,6 +90,12 @@ var (
 	smtpEnabled bool
 )
 
+// BetterAuth standalone auth server
+var (
+	betterAuthURL     string // e.g. http://betterauth.betterauth.svc.cluster.local:3000
+	betterAuthEnabled bool
+)
+
 // ConsumedMessage holds a consumed message for display
 type ConsumedMessage struct {
 	Body      string    `json:"body"`
@@ -511,6 +517,92 @@ const pageTemplate = `<!DOCTYPE html>
                 document.getElementById('email-input').addEventListener('keypress', function(e) { if (e.key === 'Enter') sendEmail(); });
             </script>
             <p style="color: #666; margin-top: 1rem; font-size: 0.8rem;">Pipeline: Go net/smtp → Maddy (ClusterIP:587) → Resend API → DKIM-signed delivery. View metrics: epochcloud_email*</p>
+        </div>
+        <div class="card">
+            <h2>🔐 BetterAuth Demo</h2>
+            <p style="color: #888; margin-bottom: 1rem;">Centralized auth server: register, login, and validate sessions via BetterAuth API</p>
+            <div style="margin-bottom: 1rem;">
+                <button onclick="checkAuthStatus()" id="auth-status-btn"
+                    style="padding: 0.5rem 1rem; border-radius: 8px; border: 1px solid rgba(0,217,255,0.3); background: rgba(0,217,255,0.1); color: #00d9ff; font-weight: 600; cursor: pointer; font-size: 0.85rem;">
+                    Check Status 🔗
+                </button>
+                <span id="auth-status-indicator" style="margin-left: 0.75rem; font-size: 0.85rem; color: #888;">Not checked</span>
+            </div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; margin-bottom: 0.75rem;">
+                <div>
+                    <p style="color: #aaa; font-size: 0.8rem; margin-bottom: 0.5rem; font-weight: 600;">Register</p>
+                    <input type="text" id="auth-name" placeholder="Name" style="width:100%;box-sizing:border-box;margin-bottom:0.4rem;padding:0.5rem 0.75rem;border-radius:6px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.05);color:#fff;font-size:0.85rem;outline:none;"
+                        onfocus="this.style.borderColor='#00d9ff'" onblur="this.style.borderColor='rgba(255,255,255,0.15)'" />
+                    <input type="email" id="auth-reg-email" placeholder="Email" style="width:100%;box-sizing:border-box;margin-bottom:0.4rem;padding:0.5rem 0.75rem;border-radius:6px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.05);color:#fff;font-size:0.85rem;outline:none;"
+                        onfocus="this.style.borderColor='#00d9ff'" onblur="this.style.borderColor='rgba(255,255,255,0.15)'" />
+                    <input type="password" id="auth-reg-pass" placeholder="Password" style="width:100%;box-sizing:border-box;margin-bottom:0.4rem;padding:0.5rem 0.75rem;border-radius:6px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.05);color:#fff;font-size:0.85rem;outline:none;"
+                        onfocus="this.style.borderColor='#00d9ff'" onblur="this.style.borderColor='rgba(255,255,255,0.15)'" />
+                    <button onclick="authRegister()" id="auth-reg-btn"
+                        style="width:100%;padding:0.5rem;border-radius:6px;border:none;background:linear-gradient(90deg,#00d9ff,#00ff88);color:#1a1a2e;font-weight:600;cursor:pointer;font-size:0.85rem;">
+                        Register ✨
+                    </button>
+                </div>
+                <div>
+                    <p style="color: #aaa; font-size: 0.8rem; margin-bottom: 0.5rem; font-weight: 600;">Login</p>
+                    <div style="height: calc(0.5rem * 2 + 0.85rem * 1.5 + 0.4rem);"></div>
+                    <input type="email" id="auth-login-email" placeholder="Email" style="width:100%;box-sizing:border-box;margin-bottom:0.4rem;padding:0.5rem 0.75rem;border-radius:6px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.05);color:#fff;font-size:0.85rem;outline:none;"
+                        onfocus="this.style.borderColor='#00d9ff'" onblur="this.style.borderColor='rgba(255,255,255,0.15)'" />
+                    <input type="password" id="auth-login-pass" placeholder="Password" style="width:100%;box-sizing:border-box;margin-bottom:0.4rem;padding:0.5rem 0.75rem;border-radius:6px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.05);color:#fff;font-size:0.85rem;outline:none;"
+                        onfocus="this.style.borderColor='#00d9ff'" onblur="this.style.borderColor='rgba(255,255,255,0.15)'" />
+                    <button onclick="authLogin()" id="auth-login-btn"
+                        style="width:100%;padding:0.5rem;border-radius:6px;border:none;background:linear-gradient(90deg,#ff6b6b,#ffa07a);color:#1a1a2e;font-weight:600;cursor:pointer;font-size:0.85rem;">
+                        Login 🔑
+                    </button>
+                </div>
+            </div>
+            <button onclick="authSession()" id="auth-session-btn"
+                style="width:100%;padding:0.5rem 1rem;border-radius:6px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.05);color:#ccc;cursor:pointer;font-size:0.85rem;margin-bottom:0.5rem;">
+                Validate Session 🎫
+            </button>
+            <div id="auth-result" style="display:none;padding:0.75rem 1rem;border-radius:8px;font-size:0.85rem;max-height:150px;overflow-y:auto;"></div>
+            <script>
+                function showAuthResult(msg, ok) {
+                    var r = document.getElementById('auth-result');
+                    r.style.display='block';
+                    r.style.background = ok ? 'rgba(0,210,106,0.2)' : 'rgba(255,100,100,0.2)';
+                    r.style.color = ok ? '#00d26a' : '#ff6b6b';
+                    r.textContent = typeof msg === 'string' ? msg : JSON.stringify(msg, null, 2);
+                }
+                function checkAuthStatus() {
+                    var ind = document.getElementById('auth-status-indicator');
+                    ind.textContent = 'Checking...'; ind.style.color = '#aaa';
+                    fetch('/auth/status').then(function(r){return r.json();}).then(function(d){
+                        if (d.connected) { ind.textContent = '● Connected — ' + d.health; ind.style.color = '#00d26a'; }
+                        else { ind.textContent = '● Disconnected' + (d.error ? ' — ' + d.error : ''); ind.style.color = '#ff6b6b'; }
+                    }).catch(function(e){ ind.textContent = '● Error: ' + e; ind.style.color = '#ff6b6b'; });
+                }
+                function authRegister() {
+                    var btn = document.getElementById('auth-reg-btn');
+                    btn.disabled=true; btn.textContent='Registering...';
+                    fetch('/auth/register', {method:'POST', headers:{'Content-Type':'application/json'},
+                        body: JSON.stringify({name:document.getElementById('auth-name').value, email:document.getElementById('auth-reg-email').value, password:document.getElementById('auth-reg-pass').value})
+                    }).then(function(r){return r.json();}).then(function(d){ showAuthResult(d.message, d.success); })
+                    .catch(function(e){ showAuthResult('Network error: '+e, false); })
+                    .finally(function(){ btn.disabled=false; btn.textContent='Register ✨'; });
+                }
+                function authLogin() {
+                    var btn = document.getElementById('auth-login-btn');
+                    btn.disabled=true; btn.textContent='Logging in...';
+                    fetch('/auth/login', {method:'POST', headers:{'Content-Type':'application/json'},
+                        body: JSON.stringify({email:document.getElementById('auth-login-email').value, password:document.getElementById('auth-login-pass').value})
+                    }).then(function(r){return r.json();}).then(function(d){ showAuthResult(d.message, d.success); })
+                    .catch(function(e){ showAuthResult('Network error: '+e, false); })
+                    .finally(function(){ btn.disabled=false; btn.textContent='Login 🔑'; });
+                }
+                function authSession() {
+                    var btn = document.getElementById('auth-session-btn');
+                    btn.disabled=true; btn.textContent='Validating...';
+                    fetch('/auth/session').then(function(r){return r.json();}).then(function(d){ showAuthResult(d.message + (d.data ? ' — ' + JSON.stringify(d.data) : ''), d.success); })
+                    .catch(function(e){ showAuthResult('Network error: '+e, false); })
+                    .finally(function(){ btn.disabled=false; btn.textContent='Validate Session 🎫'; });
+                }
+            </script>
+            <p style="color: #666; margin-top: 0.75rem; font-size: 0.8rem;">Architecture: Go HTTP proxy → BetterAuth (Hono/Node.js) → CNPG PostgreSQL. Supports email/password, session tokens, OIDC.</p>
         </div>
         <div class="card">
             <h2>⚡ Knative Serverless</h2>
@@ -1873,6 +1965,311 @@ func emailSendHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// BetterAuth integration handlers
+// These demonstrate how a Go service validates sessions and proxies
+// auth requests to the centralized BetterAuth server.
+
+// AuthStatusResponse contains BetterAuth server connectivity info
+type AuthStatusResponse struct {
+	Connected bool   `json:"connected"`
+	URL       string `json:"url"`
+	Health    string `json:"health,omitempty"`
+	Error     string `json:"error,omitempty"`
+	Timestamp string `json:"timestamp"`
+}
+
+// authStatusHandler checks BetterAuth server health
+func authStatusHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_, span := tracer.Start(ctx, "authStatus")
+	defer span.End()
+
+	resp := AuthStatusResponse{
+		URL:       betterAuthURL,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	if !betterAuthEnabled {
+		resp.Error = "BetterAuth not configured (BETTERAUTH_URL not set)"
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	healthResp, err := client.Get(betterAuthURL + "/health")
+	if err != nil {
+		resp.Error = fmt.Sprintf("Connection failed: %s", err.Error())
+		logger.WarnContext(ctx, "betterauth health check failed",
+			slog.String("error", err.Error()),
+			slog.String("trace_id", span.SpanContext().TraceID().String()),
+		)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+	defer healthResp.Body.Close()
+
+	var healthBody map[string]interface{}
+	json.NewDecoder(healthResp.Body).Decode(&healthBody)
+
+	resp.Connected = healthResp.StatusCode == 200
+	if status, ok := healthBody["status"].(string); ok {
+		resp.Health = status
+	}
+	if version, ok := healthBody["version"].(string); ok {
+		resp.Health += " (v" + version + ")"
+	}
+
+	logger.InfoContext(ctx, "betterauth health check",
+		slog.Bool("connected", resp.Connected),
+		slog.String("trace_id", span.SpanContext().TraceID().String()),
+	)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// AuthActionResponse contains the result of a BetterAuth API call
+type AuthActionResponse struct {
+	Success   bool        `json:"success"`
+	Action    string      `json:"action"`
+	Message   string      `json:"message"`
+	Data      interface{} `json:"data,omitempty"`
+	Timestamp string      `json:"timestamp"`
+}
+
+// authRegisterHandler proxies a registration request to BetterAuth
+// POST /auth/register with JSON body: {"email": "...", "password": "...", "name": "..."}
+func authRegisterHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_, span := tracer.Start(ctx, "authRegister")
+	defer span.End()
+
+	if r.Method != http.MethodPost {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		json.NewEncoder(w).Encode(AuthActionResponse{
+			Action:    "register",
+			Message:   "Use POST with JSON body: {\"email\": \"...\", \"password\": \"...\", \"name\": \"...\"}",
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+
+	if !betterAuthEnabled {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(AuthActionResponse{
+			Action:    "register",
+			Message:   "BetterAuth not configured",
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+
+	// Forward the request body to BetterAuth
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		betterAuthURL+"/api/auth/sign-up/email", r.Body)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(AuthActionResponse{
+			Action:    "register",
+			Message:   fmt.Sprintf("Failed to create request: %s", err.Error()),
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(AuthActionResponse{
+			Action:    "register",
+			Message:   fmt.Sprintf("BetterAuth request failed: %s", err.Error()),
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+	defer resp.Body.Close()
+
+	var body map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&body)
+
+	success := resp.StatusCode >= 200 && resp.StatusCode < 300
+
+	logger.InfoContext(ctx, "betterauth registration attempt",
+		slog.Bool("success", success),
+		slog.Int("status_code", resp.StatusCode),
+		slog.String("trace_id", span.SpanContext().TraceID().String()),
+	)
+
+	w.Header().Set("Content-Type", "application/json")
+	if !success {
+		w.WriteHeader(resp.StatusCode)
+	}
+	json.NewEncoder(w).Encode(AuthActionResponse{
+		Success:   success,
+		Action:    "register",
+		Message:   fmt.Sprintf("Registration %s (HTTP %d)", map[bool]string{true: "successful", false: "failed"}[success], resp.StatusCode),
+		Data:      body,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// authLoginHandler proxies a login request to BetterAuth
+// POST /auth/login with JSON body: {"email": "...", "password": "..."}
+func authLoginHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_, span := tracer.Start(ctx, "authLogin")
+	defer span.End()
+
+	if r.Method != http.MethodPost {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		json.NewEncoder(w).Encode(AuthActionResponse{
+			Action:    "login",
+			Message:   "Use POST with JSON body: {\"email\": \"...\", \"password\": \"...\"}",
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+
+	if !betterAuthEnabled {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(AuthActionResponse{
+			Action:    "login",
+			Message:   "BetterAuth not configured",
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		betterAuthURL+"/api/auth/sign-in/email", r.Body)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(AuthActionResponse{
+			Action:    "login",
+			Message:   fmt.Sprintf("Failed to create request: %s", err.Error()),
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(AuthActionResponse{
+			Action:    "login",
+			Message:   fmt.Sprintf("BetterAuth request failed: %s", err.Error()),
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+	defer resp.Body.Close()
+
+	var body map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&body)
+
+	success := resp.StatusCode >= 200 && resp.StatusCode < 300
+
+	logger.InfoContext(ctx, "betterauth login attempt",
+		slog.Bool("success", success),
+		slog.Int("status_code", resp.StatusCode),
+		slog.String("trace_id", span.SpanContext().TraceID().String()),
+	)
+
+	w.Header().Set("Content-Type", "application/json")
+	if !success {
+		w.WriteHeader(resp.StatusCode)
+	}
+	json.NewEncoder(w).Encode(AuthActionResponse{
+		Success:   success,
+		Action:    "login",
+		Message:   fmt.Sprintf("Login %s (HTTP %d)", map[bool]string{true: "successful", false: "failed"}[success], resp.StatusCode),
+		Data:      body,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// authSessionHandler validates a session by forwarding cookies to BetterAuth
+// GET /auth/session — forwards the request cookies to BetterAuth's get-session endpoint
+func authSessionHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_, span := tracer.Start(ctx, "authSession")
+	defer span.End()
+
+	if !betterAuthEnabled {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(AuthActionResponse{
+			Action:    "session",
+			Message:   "BetterAuth not configured",
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		betterAuthURL+"/api/auth/get-session", nil)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(AuthActionResponse{
+			Action:    "session",
+			Message:   fmt.Sprintf("Failed to create request: %s", err.Error()),
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+
+	// Forward all cookies from the incoming request
+	for _, cookie := range r.Cookies() {
+		req.AddCookie(cookie)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(AuthActionResponse{
+			Action:    "session",
+			Message:   fmt.Sprintf("BetterAuth request failed: %s", err.Error()),
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+	defer resp.Body.Close()
+
+	var body map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&body)
+
+	hasSession := resp.StatusCode == 200 && body != nil
+
+	logger.InfoContext(ctx, "betterauth session check",
+		slog.Bool("has_session", hasSession),
+		slog.Int("status_code", resp.StatusCode),
+		slog.String("trace_id", span.SpanContext().TraceID().String()),
+	)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(AuthActionResponse{
+		Success:   hasSession,
+		Action:    "session",
+		Message:   map[bool]string{true: "Active session found", false: "No active session"}[hasSession],
+		Data:      body,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
 func main() {
 	initLogger()
 
@@ -1938,6 +2335,16 @@ func main() {
 		logger.Info("SMTP email disabled (SMTP_HOST not set)")
 	}
 
+	// Initialize BetterAuth config
+	betterAuthURL = os.Getenv("BETTERAUTH_URL")
+	if betterAuthURL == "" {
+		betterAuthURL = "http://betterauth.betterauth.svc.cluster.local:3000"
+	}
+	betterAuthEnabled = betterAuthURL != ""
+	if betterAuthEnabled {
+		logger.Info("BetterAuth enabled", slog.String("url", betterAuthURL))
+	}
+
 	appInfo.WithLabelValues(Version, Commit, BuildTime, getEnvironment()).Set(1)
 
 	mux := http.NewServeMux()
@@ -1961,6 +2368,11 @@ func main() {
 		mux.Handle("/defectdojo/status", metricsMiddleware("/defectdojo/status", defectdojoStatusHandler))
 		// Email demo endpoint
 		mux.Handle("/email/send", metricsMiddleware("/email/send", emailSendHandler))
+		// BetterAuth demo endpoints
+		mux.Handle("/auth/status", metricsMiddleware("/auth/status", authStatusHandler))
+		mux.Handle("/auth/register", metricsMiddleware("/auth/register", authRegisterHandler))
+		mux.Handle("/auth/login", metricsMiddleware("/auth/login", authLoginHandler))
+		mux.Handle("/auth/session", metricsMiddleware("/auth/session", authSessionHandler))
 	}
 
 	server := &http.Server{
