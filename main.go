@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"html/template"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/smtp"
 	"os"
 	"os/signal"
 	"strconv"
@@ -78,6 +80,14 @@ var (
 var (
 	rybbitSiteID string
 	rybbitHost   string
+)
+
+// SMTP/Email (Maddy relay)
+var (
+	smtpHost    string // e.g. maddy.maddy.svc.cluster.local
+	smtpPort    string // e.g. 587
+	smtpFrom    string // e.g. noreply@epoch.engineering
+	smtpEnabled bool
 )
 
 // ConsumedMessage holds a consumed message for display
@@ -203,6 +213,21 @@ var (
 		prometheus.GaugeOpts{
 			Name: "epochcloud_defectdojo_connected",
 			Help: "DefectDojo connection status (1=connected, 0=disconnected)",
+		},
+	)
+
+	// Email/SMTP metrics
+	emailsSentTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "epochcloud_emails_sent_total",
+			Help: "Total number of emails sent via Maddy/Resend",
+		},
+	)
+
+	emailErrors = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "epochcloud_email_errors_total",
+			Help: "Total number of email send errors",
 		},
 	)
 )
@@ -451,6 +476,41 @@ const pageTemplate = `<!DOCTYPE html>
                 <div class="info-item"><label>/defectdojo/status</label><p>Connection status, products &amp; findings summary</p></div>
             </div>
             <p style="color: #666; margin-top: 1rem; font-size: 0.8rem;">API token provisioned by setup-postsync. View metrics: epochcloud_defectdojo_*</p>
+        </div>
+        <div class="card">
+            <h2>📧 Email Demo (Maddy + Resend)</h2>
+            <p style="color: #888; margin-bottom: 1rem;">Send a test email through the full pipeline: App → Maddy SMTP Relay → Resend → Inbox</p>
+            <div style="display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap;">
+                <input type="email" id="email-input" placeholder="your@email.com"
+                    style="flex: 1; min-width: 200px; padding: 0.75rem 1rem; border-radius: 8px; border: 1px solid rgba(255,255,255,0.2); background: rgba(255,255,255,0.05); color: #fff; font-size: 0.9rem; outline: none;"
+                    onfocus="this.style.borderColor='#00d9ff'" onblur="this.style.borderColor='rgba(255,255,255,0.2)'" />
+                <button onclick="sendEmail()" id="email-btn"
+                    style="padding: 0.75rem 1.5rem; border-radius: 8px; border: none; background: linear-gradient(90deg, #00d9ff, #00ff88); color: #1a1a2e; font-weight: 600; cursor: pointer; font-size: 0.9rem; white-space: nowrap;">
+                    Send Hello ✉️
+                </button>
+            </div>
+            <div id="email-result" style="margin-top: 1rem; display: none; padding: 0.75rem 1rem; border-radius: 8px; font-size: 0.85rem;"></div>
+            <script>
+                function sendEmail() {
+                    var email = document.getElementById('email-input').value;
+                    var btn = document.getElementById('email-btn');
+                    var result = document.getElementById('email-result');
+                    if (!email) { result.style.display='block'; result.style.background='rgba(255,100,100,0.2)'; result.style.color='#ff6b6b'; result.textContent='Please enter an email address'; return; }
+                    btn.disabled = true; btn.textContent = 'Sending...';
+                    fetch('/email/send?email=' + encodeURIComponent(email))
+                        .then(function(r) { return r.json(); })
+                        .then(function(data) {
+                            result.style.display = 'block';
+                            if (data.success) { result.style.background='rgba(0,210,106,0.2)'; result.style.color='#00d26a'; }
+                            else { result.style.background='rgba(255,100,100,0.2)'; result.style.color='#ff6b6b'; }
+                            result.textContent = data.message;
+                        })
+                        .catch(function(e) { result.style.display='block'; result.style.background='rgba(255,100,100,0.2)'; result.style.color='#ff6b6b'; result.textContent='Network error: ' + e; })
+                        .finally(function() { btn.disabled = false; btn.textContent = 'Send Hello ✉️'; });
+                }
+                document.getElementById('email-input').addEventListener('keypress', function(e) { if (e.key === 'Enter') sendEmail(); });
+            </script>
+            <p style="color: #666; margin-top: 1rem; font-size: 0.8rem;">Pipeline: Go net/smtp → Maddy (ClusterIP:587) → Resend API → DKIM-signed delivery. View metrics: epochcloud_email*</p>
         </div>
         <div class="card">
             <h2>⚡ Knative Serverless</h2>
@@ -1723,6 +1783,96 @@ func defectdojoStatusHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(statusResp)
 }
 
+// EmailResponse contains the result of an email send operation
+type EmailResponse struct {
+	Success   bool   `json:"success"`
+	Message   string `json:"message"`
+	Recipient string `json:"recipient,omitempty"`
+	Timestamp string `json:"timestamp"`
+}
+
+// emailSendHandler sends a demo email via Maddy SMTP relay
+func emailSendHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_, span := tracer.Start(ctx, "sendEmail")
+	defer span.End()
+
+	w.Header().Set("Content-Type", "application/json")
+
+	if !smtpEnabled {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(EmailResponse{
+			Success:   false,
+			Message:   "Email not configured (SMTP_HOST not set)",
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+
+	// Get recipient email from query param or POST form
+	var recipient string
+	if r.Method == http.MethodPost {
+		r.ParseForm()
+		recipient = r.FormValue("email")
+	} else {
+		recipient = r.URL.Query().Get("email")
+	}
+
+	if recipient == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(EmailResponse{
+			Success:   false,
+			Message:   "Missing 'email' parameter",
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+
+	// Build the email
+	hostname, _ := os.Hostname()
+	subject := "Hello from EpochCloud!"
+	body := fmt.Sprintf("Hello!\n\nThis email was sent from the EpochCloud test application to demonstrate the full email pipeline:\n\n  App Pod (%s) -> Maddy SMTP Relay -> Resend API -> Your Inbox\n\nStack: Go net/smtp -> Maddy (internal relay) -> Resend (transactional email) -> Cloudflare DNS (DKIM/SPF)\n\nVersion: %s\nEnvironment: %s\nTimestamp: %s\n\n-- EpochCloud\n",
+		hostname, Version, getEnvironment(), time.Now().UTC().Format(time.RFC3339))
+
+	msg := fmt.Sprintf("From: EpochCloud <%s>\r\nTo: %s\r\nSubject: %s\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n%s",
+		smtpFrom, recipient, subject, body)
+
+	// Send via Maddy (no auth needed for internal relay)
+	addr := net.JoinHostPort(smtpHost, smtpPort)
+	err := smtp.SendMail(addr, nil, smtpFrom, []string{recipient}, []byte(msg))
+	if err != nil {
+		emailErrors.Inc()
+		logger.ErrorContext(ctx, "email send failed",
+			slog.String("recipient", recipient),
+			slog.String("error", err.Error()),
+			slog.String("trace_id", span.SpanContext().TraceID().String()),
+		)
+		span.RecordError(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(EmailResponse{
+			Success:   false,
+			Message:   fmt.Sprintf("Failed to send email: %s", err.Error()),
+			Recipient: recipient,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+
+	emailsSentTotal.Inc()
+	logger.InfoContext(ctx, "email sent",
+		slog.String("recipient", recipient),
+		slog.String("from", smtpFrom),
+		slog.String("trace_id", span.SpanContext().TraceID().String()),
+	)
+
+	json.NewEncoder(w).Encode(EmailResponse{
+		Success:   true,
+		Message:   "Email sent successfully! Check your inbox.",
+		Recipient: recipient,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
 func main() {
 	initLogger()
 
@@ -1767,6 +1917,27 @@ func main() {
 	rybbitSiteID = os.Getenv("RYBBIT_SITE_ID")
 	rybbitHost = os.Getenv("RYBBIT_HOST")
 
+	// Initialize SMTP/Email config
+	smtpHost = os.Getenv("SMTP_HOST")
+	smtpPort = os.Getenv("SMTP_PORT")
+	if smtpPort == "" {
+		smtpPort = "587"
+	}
+	smtpFrom = os.Getenv("SMTP_FROM")
+	if smtpFrom == "" {
+		smtpFrom = "noreply@epoch.engineering"
+	}
+	smtpEnabled = smtpHost != ""
+	if smtpEnabled {
+		logger.Info("SMTP email enabled",
+			slog.String("host", smtpHost),
+			slog.String("port", smtpPort),
+			slog.String("from", smtpFrom),
+		)
+	} else {
+		logger.Info("SMTP email disabled (SMTP_HOST not set)")
+	}
+
 	appInfo.WithLabelValues(Version, Commit, BuildTime, getEnvironment()).Set(1)
 
 	mux := http.NewServeMux()
@@ -1788,6 +1959,8 @@ func main() {
 		mux.Handle("/cache/get", metricsMiddleware("/cache/get", valkeyGetHandler))
 		// DefectDojo security demo endpoint
 		mux.Handle("/defectdojo/status", metricsMiddleware("/defectdojo/status", defectdojoStatusHandler))
+		// Email demo endpoint
+		mux.Handle("/email/send", metricsMiddleware("/email/send", emailSendHandler))
 	}
 
 	server := &http.Server{
