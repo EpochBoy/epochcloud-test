@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -94,6 +95,12 @@ var (
 var (
 	betterAuthURL     string // e.g. http://betterauth.betterauth.svc.cluster.local:3000
 	betterAuthEnabled bool
+)
+
+// GO Feature Flag relay proxy
+var (
+	goFeatureFlagURL     string // e.g. http://relay-proxy.gofeatureflag.svc.cluster.local:1031
+	goFeatureFlagEnabled bool
 )
 
 // ConsumedMessage holds a consumed message for display
@@ -234,6 +241,22 @@ var (
 		prometheus.CounterOpts{
 			Name: "epochcloud_email_errors_total",
 			Help: "Total number of email send errors",
+		},
+	)
+
+	// Feature flag metrics
+	featureFlagEvaluations = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "epochcloud_feature_flag_evaluations_total",
+			Help: "Total feature flag evaluations by flag name and result",
+		},
+		[]string{"flag", "value"},
+	)
+
+	featureFlagErrors = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "epochcloud_feature_flag_errors_total",
+			Help: "Total feature flag evaluation errors",
 		},
 	)
 )
@@ -603,6 +626,82 @@ const pageTemplate = `<!DOCTYPE html>
                 }
             </script>
             <p style="color: #666; margin-top: 0.75rem; font-size: 0.8rem;">Architecture: Go HTTP proxy → BetterAuth (Hono/Node.js) → CNPG PostgreSQL. Supports email/password, session tokens, OIDC.</p>
+        </div>
+        <div class="card">
+            <h2>🚩 Feature Flags (GO Feature Flag)</h2>
+            <p style="color: #888; margin-bottom: 1rem;">Evaluate feature flags in real-time via the GO Feature Flag relay proxy:</p>
+            <div style="margin-bottom: 1rem;">
+                <button onclick="checkFfStatus()" id="ff-status-btn"
+                    style="padding: 0.5rem 1rem; border-radius: 8px; border: 1px solid rgba(0,217,255,0.3); background: rgba(0,217,255,0.1); color: #00d9ff; font-weight: 600; cursor: pointer; font-size: 0.85rem;">
+                    Check Status 🔗
+                </button>
+                <span id="ff-status-indicator" style="margin-left: 0.75rem; font-size: 0.85rem; color: #888;">Not checked</span>
+            </div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; margin-bottom: 0.75rem;">
+                <div>
+                    <p style="color: #aaa; font-size: 0.8rem; margin-bottom: 0.5rem; font-weight: 600;">Evaluate Single Flag</p>
+                    <select id="ff-flag-name" style="width:100%;box-sizing:border-box;margin-bottom:0.4rem;padding:0.5rem 0.75rem;border-radius:6px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.08);color:#fff;font-size:0.85rem;outline:none;">
+                        <option value="maintenance-mode">maintenance-mode</option>
+                        <option value="new-dashboard-layout">new-dashboard-layout</option>
+                        <option value="dark-mode">dark-mode</option>
+                        <option value="welcome-banner">welcome-banner</option>
+                    </select>
+                    <input type="text" id="ff-user-id" placeholder="User ID (e.g. user-123)" value="user-123" style="width:100%;box-sizing:border-box;margin-bottom:0.4rem;padding:0.5rem 0.75rem;border-radius:6px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.05);color:#fff;font-size:0.85rem;outline:none;"
+                        onfocus="this.style.borderColor='#00d9ff'" onblur="this.style.borderColor='rgba(255,255,255,0.15)'" />
+                    <button onclick="ffEvaluate()" id="ff-eval-btn"
+                        style="width:100%;padding:0.5rem;border-radius:6px;border:none;background:linear-gradient(90deg,#00d9ff,#00ff88);color:#1a1a2e;font-weight:600;cursor:pointer;font-size:0.85rem;">
+                        Evaluate 🎯
+                    </button>
+                </div>
+                <div>
+                    <p style="color: #aaa; font-size: 0.8rem; margin-bottom: 0.5rem; font-weight: 600;">Evaluate All Flags</p>
+                    <input type="text" id="ff-all-user-id" placeholder="User ID (e.g. user-456)" value="user-456" style="width:100%;box-sizing:border-box;margin-bottom:0.4rem;padding:0.5rem 0.75rem;border-radius:6px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.05);color:#fff;font-size:0.85rem;outline:none;"
+                        onfocus="this.style.borderColor='#00d9ff'" onblur="this.style.borderColor='rgba(255,255,255,0.15)'" />
+                    <div style="height: calc(0.5rem * 2 + 0.85rem * 1.5 + 0.4rem);"></div>
+                    <button onclick="ffEvalAll()" id="ff-all-btn"
+                        style="width:100%;padding:0.5rem;border-radius:6px;border:none;background:linear-gradient(90deg,#feca57,#ff6b6b);color:#1a1a2e;font-weight:600;cursor:pointer;font-size:0.85rem;">
+                        Evaluate All 🏁
+                    </button>
+                </div>
+            </div>
+            <div id="ff-result" style="display:none;padding:0.75rem 1rem;border-radius:8px;font-size:0.85rem;max-height:200px;overflow-y:auto;font-family:monospace;white-space:pre-wrap;"></div>
+            <script>
+                function showFfResult(msg, ok) {
+                    var r = document.getElementById('ff-result');
+                    r.style.display='block';
+                    r.style.background = ok ? 'rgba(0,210,106,0.2)' : 'rgba(255,100,100,0.2)';
+                    r.style.color = ok ? '#00d26a' : '#ff6b6b';
+                    r.textContent = typeof msg === 'string' ? msg : JSON.stringify(msg, null, 2);
+                }
+                function checkFfStatus() {
+                    var ind = document.getElementById('ff-status-indicator');
+                    ind.textContent = 'Checking...'; ind.style.color = '#aaa';
+                    fetch('/features/status').then(function(r){return r.json();}).then(function(d){
+                        if (d.connected) { ind.textContent = '● Connected — ' + (d.flags_available || 0) + ' flags'; ind.style.color = '#00d26a'; }
+                        else { ind.textContent = '● Disconnected' + (d.error ? ' — ' + d.error : ''); ind.style.color = '#ff6b6b'; }
+                    }).catch(function(e){ ind.textContent = '● Error: ' + e; ind.style.color = '#ff6b6b'; });
+                }
+                function ffEvaluate() {
+                    var btn = document.getElementById('ff-eval-btn');
+                    btn.disabled=true; btn.textContent='Evaluating...';
+                    var flag = document.getElementById('ff-flag-name').value;
+                    var uid = document.getElementById('ff-user-id').value || 'anonymous';
+                    fetch('/features/evaluate?flag=' + encodeURIComponent(flag) + '&user=' + encodeURIComponent(uid))
+                    .then(function(r){return r.json();}).then(function(d){ showFfResult(JSON.stringify(d, null, 2), !d.error); })
+                    .catch(function(e){ showFfResult('Network error: '+e, false); })
+                    .finally(function(){ btn.disabled=false; btn.textContent='Evaluate 🎯'; });
+                }
+                function ffEvalAll() {
+                    var btn = document.getElementById('ff-all-btn');
+                    btn.disabled=true; btn.textContent='Evaluating...';
+                    var uid = document.getElementById('ff-all-user-id').value || 'anonymous';
+                    fetch('/features/all?user=' + encodeURIComponent(uid))
+                    .then(function(r){return r.json();}).then(function(d){ showFfResult(JSON.stringify(d, null, 2), !d.error); })
+                    .catch(function(e){ showFfResult('Network error: '+e, false); })
+                    .finally(function(){ btn.disabled=false; btn.textContent='Evaluate All 🏁'; });
+                }
+            </script>
+            <p style="color: #666; margin-top: 0.75rem; font-size: 0.8rem;">Architecture: Go HTTP client → GO Feature Flag relay proxy (file-based retriever) → GitOps-managed flag YAML. OpenFeature-compatible.</p>
         </div>
         <div class="card">
             <h2>⚡ Knative Serverless</h2>
@@ -2270,6 +2369,240 @@ func authSessionHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// GO Feature Flag integration handlers
+// These demonstrate how a Go service evaluates feature flags via the
+// GO Feature Flag relay proxy REST API.
+
+// FeatureFlagStatusResponse contains relay proxy connectivity info
+type FeatureFlagStatusResponse struct {
+	Connected      bool   `json:"connected"`
+	URL            string `json:"url"`
+	FlagsAvailable int    `json:"flags_available,omitempty"`
+	Error          string `json:"error,omitempty"`
+	Timestamp      string `json:"timestamp"`
+}
+
+// FeatureFlagEvalResponse contains a single flag evaluation result
+type FeatureFlagEvalResponse struct {
+	Flag          string      `json:"flag"`
+	Value         interface{} `json:"value"`
+	VariationType string      `json:"variationType,omitempty"`
+	Reason        string      `json:"reason,omitempty"`
+	Failed        bool        `json:"failed,omitempty"`
+	Error         string      `json:"error,omitempty"`
+	Timestamp     string      `json:"timestamp"`
+}
+
+// featureFlagStatusHandler checks relay proxy health and flag availability
+func featureFlagStatusHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_, span := tracer.Start(ctx, "featureFlagStatus")
+	defer span.End()
+
+	resp := FeatureFlagStatusResponse{
+		URL:       goFeatureFlagURL,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	if !goFeatureFlagEnabled {
+		resp.Error = "GO Feature Flag not configured (GOFEATUREFLAG_URL not set)"
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	// Evaluate all flags to check connectivity and count available flags
+	evalCtx := map[string]interface{}{
+		"evaluationContext": map[string]interface{}{
+			"targetingKey": "health-check",
+		},
+	}
+	body, _ := json.Marshal(evalCtx)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	evalResp, err := client.Post(goFeatureFlagURL+"/v1/allflags", "application/json", bytes.NewReader(body))
+	if err != nil {
+		resp.Error = fmt.Sprintf("Connection failed: %s", err.Error())
+		logger.WarnContext(ctx, "gofeatureflag health check failed",
+			slog.String("error", err.Error()),
+			slog.String("trace_id", span.SpanContext().TraceID().String()),
+		)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+	defer evalResp.Body.Close()
+
+	var allFlags map[string]interface{}
+	json.NewDecoder(evalResp.Body).Decode(&allFlags)
+
+	resp.Connected = evalResp.StatusCode == 200
+	if flags, ok := allFlags["flags"].(map[string]interface{}); ok {
+		resp.FlagsAvailable = len(flags)
+	} else {
+		// Top-level keys are flag names
+		resp.FlagsAvailable = len(allFlags)
+	}
+
+	logger.InfoContext(ctx, "gofeatureflag health check",
+		slog.Bool("connected", resp.Connected),
+		slog.Int("flags", resp.FlagsAvailable),
+		slog.String("trace_id", span.SpanContext().TraceID().String()),
+	)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// featureFlagEvaluateHandler evaluates a single feature flag
+// GET /features/evaluate?flag=<name>&user=<id>
+func featureFlagEvaluateHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_, span := tracer.Start(ctx, "featureFlagEvaluate")
+	defer span.End()
+
+	flagName := r.URL.Query().Get("flag")
+	userID := r.URL.Query().Get("user")
+	if flagName == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(FeatureFlagEvalResponse{
+			Error:     "Missing 'flag' query parameter",
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+	if userID == "" {
+		userID = "anonymous"
+	}
+
+	if !goFeatureFlagEnabled {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(FeatureFlagEvalResponse{
+			Flag:      flagName,
+			Error:     "GO Feature Flag not configured",
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+
+	evalCtx := map[string]interface{}{
+		"evaluationContext": map[string]interface{}{
+			"targetingKey": userID,
+			"environment":  getEnvironment(),
+		},
+		"defaultValue": false,
+	}
+	body, _ := json.Marshal(evalCtx)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	evalResp, err := client.Post(
+		goFeatureFlagURL+"/v1/feature/"+flagName+"/eval",
+		"application/json",
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		featureFlagErrors.Inc()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(FeatureFlagEvalResponse{
+			Flag:      flagName,
+			Error:     fmt.Sprintf("Relay proxy request failed: %s", err.Error()),
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+	defer evalResp.Body.Close()
+
+	var result map[string]interface{}
+	json.NewDecoder(evalResp.Body).Decode(&result)
+
+	value := result["value"]
+	variationType, _ := result["variationType"].(string)
+	reason, _ := result["reason"].(string)
+	failed, _ := result["failed"].(bool)
+
+	if failed {
+		featureFlagErrors.Inc()
+	}
+	featureFlagEvaluations.WithLabelValues(flagName, fmt.Sprintf("%v", value)).Inc()
+
+	logger.InfoContext(ctx, "feature flag evaluated",
+		slog.String("flag", flagName),
+		slog.String("user", userID),
+		slog.Any("value", value),
+		slog.String("variation", variationType),
+		slog.String("reason", reason),
+		slog.String("trace_id", span.SpanContext().TraceID().String()),
+	)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(FeatureFlagEvalResponse{
+		Flag:          flagName,
+		Value:         value,
+		VariationType: variationType,
+		Reason:        reason,
+		Failed:        failed,
+		Timestamp:     time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// featureFlagAllHandler evaluates all feature flags for a user
+// GET /features/all?user=<id>
+func featureFlagAllHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_, span := tracer.Start(ctx, "featureFlagAll")
+	defer span.End()
+
+	userID := r.URL.Query().Get("user")
+	if userID == "" {
+		userID = "anonymous"
+	}
+
+	if !goFeatureFlagEnabled {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error":     "GO Feature Flag not configured",
+			"timestamp": time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+
+	evalCtx := map[string]interface{}{
+		"evaluationContext": map[string]interface{}{
+			"targetingKey": userID,
+			"environment":  getEnvironment(),
+		},
+	}
+	body, _ := json.Marshal(evalCtx)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	evalResp, err := client.Post(goFeatureFlagURL+"/v1/allflags", "application/json", bytes.NewReader(body))
+	if err != nil {
+		featureFlagErrors.Inc()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error":     fmt.Sprintf("Relay proxy request failed: %s", err.Error()),
+			"timestamp": time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+	defer evalResp.Body.Close()
+
+	var allFlags map[string]interface{}
+	json.NewDecoder(evalResp.Body).Decode(&allFlags)
+
+	logger.InfoContext(ctx, "all feature flags evaluated",
+		slog.String("user", userID),
+		slog.Int("flag_count", len(allFlags)),
+		slog.String("trace_id", span.SpanContext().TraceID().String()),
+	)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(allFlags)
+}
+
 func main() {
 	initLogger()
 
@@ -2345,6 +2678,16 @@ func main() {
 		logger.Info("BetterAuth enabled", slog.String("url", betterAuthURL))
 	}
 
+	// Initialize GO Feature Flag relay proxy config
+	goFeatureFlagURL = os.Getenv("GOFEATUREFLAG_URL")
+	if goFeatureFlagURL == "" {
+		goFeatureFlagURL = "http://relay-proxy.gofeatureflag.svc.cluster.local:1031"
+	}
+	goFeatureFlagEnabled = goFeatureFlagURL != ""
+	if goFeatureFlagEnabled {
+		logger.Info("GO Feature Flag enabled", slog.String("url", goFeatureFlagURL))
+	}
+
 	appInfo.WithLabelValues(Version, Commit, BuildTime, getEnvironment()).Set(1)
 
 	mux := http.NewServeMux()
@@ -2373,6 +2716,10 @@ func main() {
 		mux.Handle("/auth/register", metricsMiddleware("/auth/register", authRegisterHandler))
 		mux.Handle("/auth/login", metricsMiddleware("/auth/login", authLoginHandler))
 		mux.Handle("/auth/session", metricsMiddleware("/auth/session", authSessionHandler))
+		// GO Feature Flag demo endpoints
+		mux.Handle("/features/status", metricsMiddleware("/features/status", featureFlagStatusHandler))
+		mux.Handle("/features/evaluate", metricsMiddleware("/features/evaluate", featureFlagEvaluateHandler))
+		mux.Handle("/features/all", metricsMiddleware("/features/all", featureFlagAllHandler))
 	}
 
 	server := &http.Server{
