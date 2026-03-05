@@ -727,8 +727,8 @@ const pageTemplate = `<!DOCTYPE html>
             </div>
         </div>
         <div class="card" style="border: 1px dashed rgba(255,255,255,0.15);">
-            <h2>🔮 Pending Stack</h2>
-            <p style="color: #888; margin-bottom: 1rem;">Agreed upon — implementation planned:</p>
+            <h2>🔍 Under Review</h2>
+            <p style="color: #888; margin-bottom: 1rem;">Agreed upon — implementation in progress:</p>
             <div class="observability">
                 <div class="obs-item"><div class="icon">🔥</div><div class="label">LitmusChaos</div><div class="desc">Chaos engineering</div></div>
             </div>
