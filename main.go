@@ -726,6 +726,14 @@ const pageTemplate = `<!DOCTYPE html>
                 <div class="obs-item"><div class="icon">🛡️</div><div class="label">CrowdSec</div><div class="desc">Threat intel</div></div>
             </div>
         </div>
+        <div class="card" style="border: 1px dashed rgba(255,255,255,0.15);">
+            <h2>🔮 Pending Stack</h2>
+            <p style="color: #888; margin-bottom: 1rem;">Agreed upon — implementation planned:</p>
+            <div class="observability">
+                <div class="obs-item"><div class="icon">🔥</div><div class="label">LitmusChaos</div><div class="desc">Chaos engineering</div></div>
+            </div>
+            <p style="color: #666; margin-top: 1rem; font-size: 0.8rem;">CNCF chaos engineering platform — infrastructure-level fault injection, experiment scheduling, GameDay workflows</p>
+        </div>
         <div class="footer">
             <p>Last refreshed: {{.Timestamp}}</p>
         </div>
