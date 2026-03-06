@@ -1,17 +1,25 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"html/template"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/smtp"
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
+
+	"github.com/redis/go-redis/v9"
+
+	amqp "github.com/rabbitmq/amqp091-go"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -39,6 +47,68 @@ var logger *slog.Logger
 
 // Tracer - OpenTelemetry tracer for Tempo
 var tracer trace.Tracer
+
+// Valkey/Redis client
+var (
+	valkeyClient  *redis.Client
+	valkeyMu      sync.RWMutex
+	valkeyEnabled bool
+)
+
+// DefectDojo API client
+var (
+	defectdojoURL     string
+	defectdojoToken   string
+	defectdojoEnabled bool
+)
+
+// RabbitMQ connection and channel
+var (
+	rabbitConn    *amqp.Connection
+	rabbitChannel *amqp.Channel
+	rabbitMu      sync.RWMutex
+	rabbitEnabled bool
+	// Consumer mode - when true, only consume messages (no HTTP server except /health and /metrics)
+	// Used by KEDA-scaled consumer pods
+	consumerMode bool
+	// Stores last N consumed messages for demo display
+	consumedMessages     []ConsumedMessage
+	consumedMessagesMu   sync.RWMutex
+	maxConsumedMessages  = 10
+)
+
+// Rybbit analytics
+var (
+	rybbitSiteID string
+	rybbitHost   string
+)
+
+// SMTP/Email (Maddy relay)
+var (
+	smtpHost    string // e.g. maddy.maddy.svc.cluster.local
+	smtpPort    string // e.g. 587
+	smtpFrom    string // e.g. noreply@epoch.engineering
+	smtpEnabled bool
+)
+
+// BetterAuth standalone auth server
+var (
+	betterAuthURL     string // e.g. http://betterauth.betterauth.svc.cluster.local:3000
+	betterAuthEnabled bool
+)
+
+// GO Feature Flag relay proxy
+var (
+	goFeatureFlagURL     string // e.g. http://relay-proxy.gofeatureflag.svc.cluster.local:1031
+	goFeatureFlagEnabled bool
+)
+
+// ConsumedMessage holds a consumed message for display
+type ConsumedMessage struct {
+	Body      string    `json:"body"`
+	Timestamp time.Time `json:"timestamp"`
+	TraceID   string    `json:"trace_id"`
+}
 
 // Prometheus metrics
 var (
@@ -83,6 +153,112 @@ var (
 		},
 		[]string{"type"},
 	)
+
+	// RabbitMQ metrics
+	rabbitMessagesPublished = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "epochcloud_rabbitmq_messages_published_total",
+			Help: "Total number of messages published to RabbitMQ",
+		},
+	)
+
+	rabbitMessagesConsumed = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "epochcloud_rabbitmq_messages_consumed_total",
+			Help: "Total number of messages consumed from RabbitMQ",
+		},
+	)
+
+	rabbitPublishErrors = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "epochcloud_rabbitmq_publish_errors_total",
+			Help: "Total number of publish errors",
+		},
+	)
+
+	rabbitConnectionStatus = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "epochcloud_rabbitmq_connected",
+			Help: "RabbitMQ connection status (1=connected, 0=disconnected)",
+		},
+	)
+
+	// Valkey/Redis metrics
+	valkeyCacheHits = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "epochcloud_valkey_cache_hits_total",
+			Help: "Total number of Valkey cache hits",
+		},
+	)
+
+	valkeyCacheMisses = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "epochcloud_valkey_cache_misses_total",
+			Help: "Total number of Valkey cache misses",
+		},
+	)
+
+	valkeyOperations = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "epochcloud_valkey_operations_total",
+			Help: "Total number of Valkey operations by type",
+		},
+		[]string{"operation"},
+	)
+
+	valkeyConnectionStatus = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "epochcloud_valkey_connected",
+			Help: "Valkey connection status (1=connected, 0=disconnected)",
+		},
+	)
+
+	// DefectDojo metrics
+	defectdojoAPIRequests = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "epochcloud_defectdojo_api_requests_total",
+			Help: "Total DefectDojo API requests by endpoint and status",
+		},
+		[]string{"endpoint", "status"},
+	)
+
+	defectdojoConnectionStatus = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "epochcloud_defectdojo_connected",
+			Help: "DefectDojo connection status (1=connected, 0=disconnected)",
+		},
+	)
+
+	// Email/SMTP metrics
+	emailsSentTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "epochcloud_emails_sent_total",
+			Help: "Total number of emails sent via Maddy/Resend",
+		},
+	)
+
+	emailErrors = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "epochcloud_email_errors_total",
+			Help: "Total number of email send errors",
+		},
+	)
+
+	// Feature flag metrics
+	featureFlagEvaluations = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "epochcloud_feature_flag_evaluations_total",
+			Help: "Total feature flag evaluations by flag name and result",
+		},
+		[]string{"flag", "value"},
+	)
+
+	featureFlagErrors = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "epochcloud_feature_flag_errors_total",
+			Help: "Total feature flag evaluation errors",
+		},
+	)
 )
 
 type HealthResponse struct {
@@ -99,12 +275,14 @@ type VersionResponse struct {
 }
 
 type PageData struct {
-	Version     string
-	Commit      string
-	BuildTime   string
-	Hostname    string
-	Environment string
-	Timestamp   string
+	Version      string
+	Commit       string
+	BuildTime    string
+	Hostname     string
+	Environment  string
+	Timestamp    string
+	RybbitSiteID string
+	RybbitHost   string
 }
 
 const pageTemplate = `<!DOCTYPE html>
@@ -149,6 +327,27 @@ const pageTemplate = `<!DOCTYPE html>
         .env-dev { background: #ff6b6b; color: #fff; }
         .env-staging { background: #feca57; color: #1a1a2e; }
         .env-prod { background: #00d26a; color: #fff; }
+        .stage-nav {
+            display: flex;
+            justify-content: center;
+            gap: 0.5rem;
+            margin-top: 1rem;
+        }
+        .stage-pill {
+            display: inline-block;
+            padding: 0.4rem 1.2rem;
+            border-radius: 50px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            font-size: 0.85rem;
+            text-decoration: none;
+            opacity: 0.4;
+            transition: opacity 0.2s, transform 0.2s;
+            cursor: pointer;
+        }
+        .stage-pill:hover { opacity: 0.8; transform: scale(1.05); }
+        .stage-pill.active { opacity: 1; cursor: default; transform: none; box-shadow: 0 0 12px rgba(255,255,255,0.2); }
         .card {
             background: rgba(255, 255, 255, 0.05);
             backdrop-filter: blur(10px);
@@ -211,6 +410,7 @@ const pageTemplate = `<!DOCTYPE html>
         .footer { text-align: center; margin-top: 2rem; font-size: 0.85rem; color: #666; }
         .footer a { color: #00d9ff; text-decoration: none; }
     </style>
+    {{if and .RybbitSiteID .RybbitHost}}<script src="{{.RybbitHost}}/script.js" data-site-id="{{.RybbitSiteID}}" defer></script>{{end}}
 </head>
 <body>
     <div class="container">
@@ -218,6 +418,30 @@ const pageTemplate = `<!DOCTYPE html>
             <h1>🚀 EpochCloud Test</h1>
             <p>GitOps proof-of-concept demonstrating the full CI/CD pipeline</p>
             <span class="env-badge env-{{.Environment}}">{{.Environment}}</span>
+            <div class="stage-nav" id="stage-nav"></div>
+            <script>
+                (function() {
+                    var env = '{{.Environment}}';
+                    var host = window.location.hostname;
+                    // Extract base domain: remove test-dev./test-staging./test. prefix
+                    var domain = host.replace(/^test-(dev|staging)\./, '').replace(/^test\./, '');
+                    var stages = [
+                        {name: 'dev', prefix: 'test-dev', cls: 'env-dev'},
+                        {name: 'staging', prefix: 'test-staging', cls: 'env-staging'},
+                        {name: 'prod', prefix: 'test', cls: 'env-prod'}
+                    ];
+                    var nav = document.getElementById('stage-nav');
+                    stages.forEach(function(s) {
+                        var a = document.createElement('a');
+                        a.className = 'stage-pill ' + s.cls + (env === s.name ? ' active' : '');
+                        a.textContent = s.name;
+                        if (env !== s.name) {
+                            a.href = window.location.protocol + '//' + s.prefix + '.' + domain + window.location.pathname;
+                        }
+                        nav.appendChild(a);
+                    });
+                })();
+            </script>
         </div>
         <div class="card">
             <h2>📦 Build Information</h2>
@@ -235,7 +459,9 @@ const pageTemplate = `<!DOCTYPE html>
                 <div class="obs-item"><div class="icon">📈</div><div class="label">Prometheus</div><div class="desc">Metrics at /metrics</div></div>
                 <div class="obs-item"><div class="icon">📋</div><div class="label">Loki</div><div class="desc">JSON structured logs</div></div>
                 <div class="obs-item"><div class="icon">🔍</div><div class="label">Tempo</div><div class="desc">Distributed tracing</div></div>
-                <div class="obs-item"><div class="icon">��</div><div class="label">AlertManager</div><div class="desc">Error rate alerts</div></div>
+                <div class="obs-item"><div class="icon">🔔</div><div class="label">AlertManager</div><div class="desc">Error rate alerts</div></div>
+                <div class="obs-item"><div class="icon">🦅</div><div class="label">Falco</div><div class="desc">Runtime security</div></div>
+                <div class="obs-item"><div class="icon">📊</div><div class="label">Rybbit</div><div class="desc">Web analytics</div></div>
             </div>
         </div>
         <div class="card">
@@ -254,13 +480,259 @@ const pageTemplate = `<!DOCTYPE html>
             </div>
         </div>
         <div class="card">
-            <h2>🔥 Chaos Testing</h2>
+            <h2>� RabbitMQ Demo</h2>
+            <p style="color: #888; margin-bottom: 1rem;">Message broker integration with pub/sub demo:</p>
+            <div class="info-grid">
+                <div class="info-item"><label>/rabbitmq/status</label><p>Connection status & consumed messages</p></div>
+                <div class="info-item"><label>/rabbitmq/publish</label><p>Publish message (GET or POST)</p></div>
+                <div class="info-item"><label>/rabbitmq/publish?message=Hello</label><p>Publish custom message</p></div>
+            </div>
+            <p style="color: #666; margin-top: 1rem; font-size: 0.8rem;">Messages auto-consumed by background worker. View metrics: epochcloud_rabbitmq_*</p>
+        </div>
+        <div class="card">
+            <h2>�🔥 Chaos Testing</h2>
             <p style="color: #888; margin-bottom: 1rem;">Test the AlertManager → ntfy notification pipeline:</p>
             <div class="info-grid">
                 <div class="info-item"><label>/chaos?action=error</label><p>Triggers 500 error, increments error counter</p></div>
                 <div class="info-item"><label>/chaos?action=slow</label><p>Adds 2s latency for latency alerts</p></div>
                 <div class="info-item"><label>/chaos?action=load&count=50</label><p>Simulates N concurrent requests</p></div>
             </div>
+        </div>
+        <div class="card">
+            <h2>🛡️ DefectDojo Security</h2>
+            <p style="color: #888; margin-bottom: 1rem;">Vulnerability management integration — tracks products &amp; findings:</p>
+            <div class="info-grid">
+                <div class="info-item"><label>/defectdojo/status</label><p>Connection status, products &amp; findings summary</p></div>
+            </div>
+            <p style="color: #666; margin-top: 1rem; font-size: 0.8rem;">API token provisioned by setup-postsync. View metrics: epochcloud_defectdojo_*</p>
+        </div>
+        <div class="card">
+            <h2>📧 Email Demo (Maddy + Resend)</h2>
+            <p style="color: #888; margin-bottom: 1rem;">Send a test email through the full pipeline: App → Maddy SMTP Relay → Resend → Inbox</p>
+            <div style="display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap;">
+                <input type="email" id="email-input" placeholder="your@email.com"
+                    style="flex: 1; min-width: 200px; padding: 0.75rem 1rem; border-radius: 8px; border: 1px solid rgba(255,255,255,0.2); background: rgba(255,255,255,0.05); color: #fff; font-size: 0.9rem; outline: none;"
+                    onfocus="this.style.borderColor='#00d9ff'" onblur="this.style.borderColor='rgba(255,255,255,0.2)'" />
+                <button onclick="sendEmail()" id="email-btn"
+                    style="padding: 0.75rem 1.5rem; border-radius: 8px; border: none; background: linear-gradient(90deg, #00d9ff, #00ff88); color: #1a1a2e; font-weight: 600; cursor: pointer; font-size: 0.9rem; white-space: nowrap;">
+                    Send Hello ✉️
+                </button>
+            </div>
+            <div id="email-result" style="margin-top: 1rem; display: none; padding: 0.75rem 1rem; border-radius: 8px; font-size: 0.85rem;"></div>
+            <script>
+                function sendEmail() {
+                    var email = document.getElementById('email-input').value;
+                    var btn = document.getElementById('email-btn');
+                    var result = document.getElementById('email-result');
+                    if (!email) { result.style.display='block'; result.style.background='rgba(255,100,100,0.2)'; result.style.color='#ff6b6b'; result.textContent='Please enter an email address'; return; }
+                    btn.disabled = true; btn.textContent = 'Sending...';
+                    fetch('/email/send?email=' + encodeURIComponent(email))
+                        .then(function(r) { return r.json(); })
+                        .then(function(data) {
+                            result.style.display = 'block';
+                            if (data.success) { result.style.background='rgba(0,210,106,0.2)'; result.style.color='#00d26a'; }
+                            else { result.style.background='rgba(255,100,100,0.2)'; result.style.color='#ff6b6b'; }
+                            result.textContent = data.message;
+                        })
+                        .catch(function(e) { result.style.display='block'; result.style.background='rgba(255,100,100,0.2)'; result.style.color='#ff6b6b'; result.textContent='Network error: ' + e; })
+                        .finally(function() { btn.disabled = false; btn.textContent = 'Send Hello ✉️'; });
+                }
+                document.getElementById('email-input').addEventListener('keypress', function(e) { if (e.key === 'Enter') sendEmail(); });
+            </script>
+            <p style="color: #666; margin-top: 1rem; font-size: 0.8rem;">Pipeline: Go net/smtp → Maddy (ClusterIP:587) → Resend API → DKIM-signed delivery. View metrics: epochcloud_email*</p>
+        </div>
+        <div class="card">
+            <h2>🔐 BetterAuth Demo</h2>
+            <p style="color: #888; margin-bottom: 1rem;">Centralized auth server: register, login, and validate sessions via BetterAuth API</p>
+            <div style="margin-bottom: 1rem;">
+                <button onclick="checkAuthStatus()" id="auth-status-btn"
+                    style="padding: 0.5rem 1rem; border-radius: 8px; border: 1px solid rgba(0,217,255,0.3); background: rgba(0,217,255,0.1); color: #00d9ff; font-weight: 600; cursor: pointer; font-size: 0.85rem;">
+                    Check Status 🔗
+                </button>
+                <span id="auth-status-indicator" style="margin-left: 0.75rem; font-size: 0.85rem; color: #888;">Not checked</span>
+            </div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; margin-bottom: 0.75rem;">
+                <div>
+                    <p style="color: #aaa; font-size: 0.8rem; margin-bottom: 0.5rem; font-weight: 600;">Register</p>
+                    <input type="text" id="auth-name" placeholder="Name" style="width:100%;box-sizing:border-box;margin-bottom:0.4rem;padding:0.5rem 0.75rem;border-radius:6px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.05);color:#fff;font-size:0.85rem;outline:none;"
+                        onfocus="this.style.borderColor='#00d9ff'" onblur="this.style.borderColor='rgba(255,255,255,0.15)'" />
+                    <input type="email" id="auth-reg-email" placeholder="Email" style="width:100%;box-sizing:border-box;margin-bottom:0.4rem;padding:0.5rem 0.75rem;border-radius:6px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.05);color:#fff;font-size:0.85rem;outline:none;"
+                        onfocus="this.style.borderColor='#00d9ff'" onblur="this.style.borderColor='rgba(255,255,255,0.15)'" />
+                    <input type="password" id="auth-reg-pass" placeholder="Password" style="width:100%;box-sizing:border-box;margin-bottom:0.4rem;padding:0.5rem 0.75rem;border-radius:6px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.05);color:#fff;font-size:0.85rem;outline:none;"
+                        onfocus="this.style.borderColor='#00d9ff'" onblur="this.style.borderColor='rgba(255,255,255,0.15)'" />
+                    <button onclick="authRegister()" id="auth-reg-btn"
+                        style="width:100%;padding:0.5rem;border-radius:6px;border:none;background:linear-gradient(90deg,#00d9ff,#00ff88);color:#1a1a2e;font-weight:600;cursor:pointer;font-size:0.85rem;">
+                        Register ✨
+                    </button>
+                </div>
+                <div>
+                    <p style="color: #aaa; font-size: 0.8rem; margin-bottom: 0.5rem; font-weight: 600;">Login</p>
+                    <div style="height: calc(0.5rem * 2 + 0.85rem * 1.5 + 0.4rem);"></div>
+                    <input type="email" id="auth-login-email" placeholder="Email" style="width:100%;box-sizing:border-box;margin-bottom:0.4rem;padding:0.5rem 0.75rem;border-radius:6px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.05);color:#fff;font-size:0.85rem;outline:none;"
+                        onfocus="this.style.borderColor='#00d9ff'" onblur="this.style.borderColor='rgba(255,255,255,0.15)'" />
+                    <input type="password" id="auth-login-pass" placeholder="Password" style="width:100%;box-sizing:border-box;margin-bottom:0.4rem;padding:0.5rem 0.75rem;border-radius:6px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.05);color:#fff;font-size:0.85rem;outline:none;"
+                        onfocus="this.style.borderColor='#00d9ff'" onblur="this.style.borderColor='rgba(255,255,255,0.15)'" />
+                    <button onclick="authLogin()" id="auth-login-btn"
+                        style="width:100%;padding:0.5rem;border-radius:6px;border:none;background:linear-gradient(90deg,#ff6b6b,#ffa07a);color:#1a1a2e;font-weight:600;cursor:pointer;font-size:0.85rem;">
+                        Login 🔑
+                    </button>
+                </div>
+            </div>
+            <button onclick="authSession()" id="auth-session-btn"
+                style="width:100%;padding:0.5rem 1rem;border-radius:6px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.05);color:#ccc;cursor:pointer;font-size:0.85rem;margin-bottom:0.5rem;">
+                Validate Session 🎫
+            </button>
+            <div id="auth-result" style="display:none;padding:0.75rem 1rem;border-radius:8px;font-size:0.85rem;max-height:150px;overflow-y:auto;"></div>
+            <script>
+                function showAuthResult(msg, ok) {
+                    var r = document.getElementById('auth-result');
+                    r.style.display='block';
+                    r.style.background = ok ? 'rgba(0,210,106,0.2)' : 'rgba(255,100,100,0.2)';
+                    r.style.color = ok ? '#00d26a' : '#ff6b6b';
+                    r.textContent = typeof msg === 'string' ? msg : JSON.stringify(msg, null, 2);
+                }
+                function checkAuthStatus() {
+                    var ind = document.getElementById('auth-status-indicator');
+                    ind.textContent = 'Checking...'; ind.style.color = '#aaa';
+                    fetch('/auth/status').then(function(r){return r.json();}).then(function(d){
+                        if (d.connected) { ind.textContent = '● Connected — ' + d.health; ind.style.color = '#00d26a'; }
+                        else { ind.textContent = '● Disconnected' + (d.error ? ' — ' + d.error : ''); ind.style.color = '#ff6b6b'; }
+                    }).catch(function(e){ ind.textContent = '● Error: ' + e; ind.style.color = '#ff6b6b'; });
+                }
+                function authRegister() {
+                    var btn = document.getElementById('auth-reg-btn');
+                    btn.disabled=true; btn.textContent='Registering...';
+                    fetch('/auth/register', {method:'POST', headers:{'Content-Type':'application/json'},
+                        body: JSON.stringify({name:document.getElementById('auth-name').value, email:document.getElementById('auth-reg-email').value, password:document.getElementById('auth-reg-pass').value})
+                    }).then(function(r){return r.json();}).then(function(d){ showAuthResult(d.message, d.success); })
+                    .catch(function(e){ showAuthResult('Network error: '+e, false); })
+                    .finally(function(){ btn.disabled=false; btn.textContent='Register ✨'; });
+                }
+                function authLogin() {
+                    var btn = document.getElementById('auth-login-btn');
+                    btn.disabled=true; btn.textContent='Logging in...';
+                    fetch('/auth/login', {method:'POST', headers:{'Content-Type':'application/json'},
+                        body: JSON.stringify({email:document.getElementById('auth-login-email').value, password:document.getElementById('auth-login-pass').value})
+                    }).then(function(r){return r.json();}).then(function(d){ showAuthResult(d.message, d.success); })
+                    .catch(function(e){ showAuthResult('Network error: '+e, false); })
+                    .finally(function(){ btn.disabled=false; btn.textContent='Login 🔑'; });
+                }
+                function authSession() {
+                    var btn = document.getElementById('auth-session-btn');
+                    btn.disabled=true; btn.textContent='Validating...';
+                    fetch('/auth/session').then(function(r){return r.json();}).then(function(d){ showAuthResult(d.message + (d.data ? ' — ' + JSON.stringify(d.data) : ''), d.success); })
+                    .catch(function(e){ showAuthResult('Network error: '+e, false); })
+                    .finally(function(){ btn.disabled=false; btn.textContent='Validate Session 🎫'; });
+                }
+            </script>
+            <p style="color: #666; margin-top: 0.75rem; font-size: 0.8rem;">Architecture: Go HTTP proxy → BetterAuth (Hono/Node.js) → CNPG PostgreSQL. Supports email/password, session tokens, OIDC.</p>
+        </div>
+        <div class="card">
+            <h2>🚩 Feature Flags (GO Feature Flag)</h2>
+            <p style="color: #888; margin-bottom: 1rem;">Evaluate feature flags in real-time via the GO Feature Flag relay proxy:</p>
+            <div style="margin-bottom: 1rem;">
+                <button onclick="checkFfStatus()" id="ff-status-btn"
+                    style="padding: 0.5rem 1rem; border-radius: 8px; border: 1px solid rgba(0,217,255,0.3); background: rgba(0,217,255,0.1); color: #00d9ff; font-weight: 600; cursor: pointer; font-size: 0.85rem;">
+                    Check Status 🔗
+                </button>
+                <span id="ff-status-indicator" style="margin-left: 0.75rem; font-size: 0.85rem; color: #888;">Not checked</span>
+            </div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; margin-bottom: 0.75rem;">
+                <div>
+                    <p style="color: #aaa; font-size: 0.8rem; margin-bottom: 0.5rem; font-weight: 600;">Evaluate Single Flag</p>
+                    <select id="ff-flag-name" style="width:100%;box-sizing:border-box;margin-bottom:0.4rem;padding:0.5rem 0.75rem;border-radius:6px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.08);color:#fff;font-size:0.85rem;outline:none;">
+                        <option value="maintenance-mode">maintenance-mode</option>
+                        <option value="new-dashboard-layout">new-dashboard-layout</option>
+                        <option value="dark-mode">dark-mode</option>
+                        <option value="welcome-banner">welcome-banner</option>
+                    </select>
+                    <input type="text" id="ff-user-id" placeholder="User ID (e.g. user-123)" value="user-123" style="width:100%;box-sizing:border-box;margin-bottom:0.4rem;padding:0.5rem 0.75rem;border-radius:6px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.05);color:#fff;font-size:0.85rem;outline:none;"
+                        onfocus="this.style.borderColor='#00d9ff'" onblur="this.style.borderColor='rgba(255,255,255,0.15)'" />
+                    <button onclick="ffEvaluate()" id="ff-eval-btn"
+                        style="width:100%;padding:0.5rem;border-radius:6px;border:none;background:linear-gradient(90deg,#00d9ff,#00ff88);color:#1a1a2e;font-weight:600;cursor:pointer;font-size:0.85rem;">
+                        Evaluate 🎯
+                    </button>
+                </div>
+                <div>
+                    <p style="color: #aaa; font-size: 0.8rem; margin-bottom: 0.5rem; font-weight: 600;">Evaluate All Flags</p>
+                    <input type="text" id="ff-all-user-id" placeholder="User ID (e.g. user-456)" value="user-456" style="width:100%;box-sizing:border-box;margin-bottom:0.4rem;padding:0.5rem 0.75rem;border-radius:6px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.05);color:#fff;font-size:0.85rem;outline:none;"
+                        onfocus="this.style.borderColor='#00d9ff'" onblur="this.style.borderColor='rgba(255,255,255,0.15)'" />
+                    <div style="height: calc(0.5rem * 2 + 0.85rem * 1.5 + 0.4rem);"></div>
+                    <button onclick="ffEvalAll()" id="ff-all-btn"
+                        style="width:100%;padding:0.5rem;border-radius:6px;border:none;background:linear-gradient(90deg,#feca57,#ff6b6b);color:#1a1a2e;font-weight:600;cursor:pointer;font-size:0.85rem;">
+                        Evaluate All 🏁
+                    </button>
+                </div>
+            </div>
+            <div id="ff-result" style="display:none;padding:0.75rem 1rem;border-radius:8px;font-size:0.85rem;max-height:200px;overflow-y:auto;font-family:monospace;white-space:pre-wrap;"></div>
+            <script>
+                function showFfResult(msg, ok) {
+                    var r = document.getElementById('ff-result');
+                    r.style.display='block';
+                    r.style.background = ok ? 'rgba(0,210,106,0.2)' : 'rgba(255,100,100,0.2)';
+                    r.style.color = ok ? '#00d26a' : '#ff6b6b';
+                    r.textContent = typeof msg === 'string' ? msg : JSON.stringify(msg, null, 2);
+                }
+                function checkFfStatus() {
+                    var ind = document.getElementById('ff-status-indicator');
+                    ind.textContent = 'Checking...'; ind.style.color = '#aaa';
+                    fetch('/features/status').then(function(r){return r.json();}).then(function(d){
+                        if (d.connected) { ind.textContent = '● Connected — ' + (d.flags_available || 0) + ' flags'; ind.style.color = '#00d26a'; }
+                        else { ind.textContent = '● Disconnected' + (d.error ? ' — ' + d.error : ''); ind.style.color = '#ff6b6b'; }
+                    }).catch(function(e){ ind.textContent = '● Error: ' + e; ind.style.color = '#ff6b6b'; });
+                }
+                function ffEvaluate() {
+                    var btn = document.getElementById('ff-eval-btn');
+                    btn.disabled=true; btn.textContent='Evaluating...';
+                    var flag = document.getElementById('ff-flag-name').value;
+                    var uid = document.getElementById('ff-user-id').value || 'anonymous';
+                    fetch('/features/evaluate?flag=' + encodeURIComponent(flag) + '&user=' + encodeURIComponent(uid))
+                    .then(function(r){return r.json();}).then(function(d){ showFfResult(JSON.stringify(d, null, 2), !d.error); })
+                    .catch(function(e){ showFfResult('Network error: '+e, false); })
+                    .finally(function(){ btn.disabled=false; btn.textContent='Evaluate 🎯'; });
+                }
+                function ffEvalAll() {
+                    var btn = document.getElementById('ff-all-btn');
+                    btn.disabled=true; btn.textContent='Evaluating...';
+                    var uid = document.getElementById('ff-all-user-id').value || 'anonymous';
+                    fetch('/features/all?user=' + encodeURIComponent(uid))
+                    .then(function(r){return r.json();}).then(function(d){ showFfResult(JSON.stringify(d, null, 2), !d.error); })
+                    .catch(function(e){ showFfResult('Network error: '+e, false); })
+                    .finally(function(){ btn.disabled=false; btn.textContent='Evaluate All 🏁'; });
+                }
+            </script>
+            <p style="color: #666; margin-top: 0.75rem; font-size: 0.8rem;">Architecture: Go HTTP client → GO Feature Flag relay proxy (file-based retriever) → GitOps-managed flag YAML. OpenFeature-compatible.</p>
+        </div>
+        <div class="card">
+            <h2>⚡ Knative Serverless</h2>
+            <p style="color: #888; margin-bottom: 1rem;">Scale-to-zero serverless workloads with Knative Serving:</p>
+            <div class="info-grid">
+                <div class="info-item"><label>Autoscaler</label><p>Request-driven KPA with scale-to-zero</p></div>
+                <div class="info-item"><label>Networking</label><p>Kourier (Envoy) internal ingress</p></div>
+                <div class="info-item"><label>Revisions</label><p>Immutable snapshots with traffic splitting</p></div>
+                <div class="info-item"><label>Service Mesh</label><p>Linkerd mTLS on all workloads</p></div>
+            </div>
+            <p style="color: #666; margin-top: 1rem; font-size: 0.8rem;">Functions deploy as Knative Services with automatic scale-to-zero after idle.</p>
+        </div>
+        <div class="card">
+            <h2>🏗️ Infrastructure Stack</h2>
+            <p style="color: #888; margin-bottom: 1rem;">Full self-hosted Kubernetes platform on Proxmox VE:</p>
+            <div class="observability">
+                <div class="obs-item"><div class="icon">☸️</div><div class="label">Talos OS</div><div class="desc">Immutable Linux</div></div>
+                <div class="obs-item"><div class="icon">🔒</div><div class="label">Linkerd</div><div class="desc">mTLS mesh</div></div>
+                <div class="obs-item"><div class="icon">🐝</div><div class="label">Cilium</div><div class="desc">eBPF networking</div></div>
+                <div class="obs-item"><div class="icon">🔑</div><div class="label">Keycloak</div><div class="desc">SSO/OIDC</div></div>
+                <div class="obs-item"><div class="icon">🗄️</div><div class="label">Harbor</div><div class="desc">Registry</div></div>
+                <div class="obs-item"><div class="icon">🛡️</div><div class="label">CrowdSec</div><div class="desc">Threat intel</div></div>
+            </div>
+        </div>
+        <div class="card" style="border: 1px dashed rgba(255,255,255,0.15);">
+            <h2>🔍 Under Review</h2>
+            <p style="color: #888; margin-bottom: 1rem;">Agreed upon — implementation in progress:</p>
+            <div class="observability">
+                <div class="obs-item"><div class="icon">🔥</div><div class="label">LitmusChaos</div><div class="desc">Chaos engineering</div></div>
+            </div>
+            <p style="color: #666; margin-top: 1rem; font-size: 0.8rem;">CNCF chaos engineering platform — infrastructure-level fault injection, experiment scheduling, GameDay workflows</p>
         </div>
         <div class="footer">
             <p>Last refreshed: {{.Timestamp}}</p>
@@ -384,12 +856,14 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 
 	hostname, _ := os.Hostname()
 	data := PageData{
-		Version:     Version,
-		Commit:      Commit,
-		BuildTime:   BuildTime,
-		Hostname:    hostname,
-		Environment: getEnvironment(),
-		Timestamp:   time.Now().UTC().Format(time.RFC3339),
+		Version:      Version,
+		Commit:       Commit,
+		BuildTime:    BuildTime,
+		Hostname:     hostname,
+		Environment:  getEnvironment(),
+		Timestamp:    time.Now().UTC().Format(time.RFC3339),
+		RybbitSiteID: rybbitSiteID,
+		RybbitHost:   rybbitHost,
 	}
 
 	tmpl, err := template.New("page").Parse(pageTemplate)
@@ -549,8 +1023,1602 @@ func (r *statusRecorder) WriteHeader(code int) {
 	r.ResponseWriter.WriteHeader(code)
 }
 
+// initRabbitMQ starts background RabbitMQ connection manager with retry logic
+func initRabbitMQ(ctx context.Context) error {
+	host := os.Getenv("RABBITMQ_HOST")
+
+	// If no host configured, RabbitMQ is optional
+	if host == "" {
+		logger.Info("RabbitMQ not configured, skipping initialization")
+		rabbitConnectionStatus.Set(0)
+		return nil
+	}
+
+	// Start background connection manager (non-blocking)
+	go rabbitConnectionManager(ctx)
+
+	return nil
+}
+
+// rabbitConnectionManager maintains RabbitMQ connection with exponential backoff retry
+func rabbitConnectionManager(ctx context.Context) {
+	host := os.Getenv("RABBITMQ_HOST")
+	port := os.Getenv("RABBITMQ_PORT")
+	user := os.Getenv("RABBITMQ_USERNAME")
+	pass := os.Getenv("RABBITMQ_PASSWORD")
+	vhost := os.Getenv("RABBITMQ_VHOST")
+
+	if port == "" {
+		port = "5672"
+	}
+	if vhost == "" {
+		vhost = "/"
+	}
+
+	url := fmt.Sprintf("amqp://%s:%s@%s:%s/%s", user, pass, host, port, vhost)
+
+	backoff := time.Second
+	maxBackoff := 30 * time.Second
+
+	for {
+		select {
+		case <-ctx.Done():
+			logger.Info("RabbitMQ connection manager shutting down")
+			return
+		default:
+		}
+
+		// Check if already connected
+		rabbitMu.RLock()
+		connected := rabbitEnabled && rabbitConn != nil && !rabbitConn.IsClosed()
+		rabbitMu.RUnlock()
+
+		if connected {
+			// Already connected, wait and check again
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Second):
+				continue
+			}
+		}
+
+		// Attempt connection
+		logger.Info("attempting RabbitMQ connection",
+			slog.String("host", host),
+			slog.String("vhost", vhost),
+		)
+
+		conn, err := amqp.Dial(url)
+		if err != nil {
+			logger.Warn("RabbitMQ connection failed, will retry",
+				slog.String("host", host),
+				slog.String("error", err.Error()),
+				slog.Duration("retry_in", backoff),
+			)
+			rabbitConnectionStatus.Set(0)
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+
+			// Exponential backoff
+			backoff = backoff * 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+
+		ch, err := conn.Channel()
+		if err != nil {
+			conn.Close()
+			logger.Warn("RabbitMQ channel open failed, will retry",
+				slog.String("error", err.Error()),
+				slog.Duration("retry_in", backoff),
+			)
+			rabbitConnectionStatus.Set(0)
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+
+			backoff = backoff * 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+
+		// Success - update state
+		rabbitMu.Lock()
+		rabbitConn = conn
+		rabbitChannel = ch
+		rabbitEnabled = true
+		rabbitMu.Unlock()
+
+		rabbitConnectionStatus.Set(1)
+		backoff = time.Second // Reset backoff on success
+
+		logger.Info("RabbitMQ connected",
+			slog.String("host", host),
+			slog.String("vhost", vhost),
+			slog.Bool("consumer_mode", consumerMode),
+		)
+
+		// Only start consumer if in consumer mode
+		// This allows producer and consumer to be separate deployments
+		var consumerCancel context.CancelFunc
+		if consumerMode {
+			var consumerCtx context.Context
+			consumerCtx, consumerCancel = context.WithCancel(ctx)
+			go startConsumer(consumerCtx)
+		} else {
+			consumerCancel = func() {} // no-op
+		}
+
+		// Wait for connection close notification
+		closeChan := make(chan *amqp.Error, 1)
+		conn.NotifyClose(closeChan)
+
+		select {
+		case <-ctx.Done():
+			consumerCancel()
+			return
+		case amqpErr := <-closeChan:
+			consumerCancel()
+			if amqpErr != nil {
+				logger.Warn("RabbitMQ connection lost, will reconnect",
+					slog.String("error", amqpErr.Error()),
+				)
+			} else {
+				logger.Info("RabbitMQ connection closed, will reconnect")
+			}
+			rabbitMu.Lock()
+			rabbitEnabled = false
+			rabbitConn = nil
+			rabbitChannel = nil
+			rabbitMu.Unlock()
+			rabbitConnectionStatus.Set(0)
+		}
+	}
+}
+
+// startConsumer starts a background consumer for the demo queue
+func startConsumer(ctx context.Context) {
+	queueName := os.Getenv("RABBITMQ_QUEUE")
+	if queueName == "" {
+		queueName = "epochcloud-demo"
+	}
+
+	rabbitMu.RLock()
+	ch := rabbitChannel
+	enabled := rabbitEnabled
+	rabbitMu.RUnlock()
+
+	if !enabled || ch == nil {
+		return
+	}
+
+	// Declare the queue (idempotent)
+	_, err := ch.QueueDeclare(
+		queueName,
+		true,  // durable
+		false, // auto-delete
+		false, // exclusive
+		false, // no-wait
+		nil,   // arguments
+	)
+	if err != nil {
+		logger.Error("failed to declare queue", slog.String("queue", queueName), slog.String("error", err.Error()))
+		return
+	}
+
+	msgs, err := ch.Consume(
+		queueName,
+		"epochcloud-test-consumer", // consumer tag
+		true,                       // auto-ack
+		false,                      // exclusive
+		false,                      // no-local
+		false,                      // no-wait
+		nil,                        // args
+	)
+	if err != nil {
+		logger.Error("failed to start consumer", slog.String("queue", queueName), slog.String("error", err.Error()))
+		return
+	}
+
+	logger.Info("RabbitMQ consumer started", slog.String("queue", queueName))
+
+	for {
+		select {
+		case <-ctx.Done():
+			logger.Info("RabbitMQ consumer shutting down")
+			return
+		case msg, ok := <-msgs:
+			if !ok {
+				logger.Warn("RabbitMQ consumer channel closed")
+				rabbitConnectionStatus.Set(0)
+				return
+			}
+			rabbitMessagesConsumed.Inc()
+
+			consumed := ConsumedMessage{
+				Body:      string(msg.Body),
+				Timestamp: time.Now(),
+				TraceID:   msg.MessageId, // Use MessageId as trace correlation
+			}
+
+			consumedMessagesMu.Lock()
+			consumedMessages = append([]ConsumedMessage{consumed}, consumedMessages...)
+			if len(consumedMessages) > maxConsumedMessages {
+				consumedMessages = consumedMessages[:maxConsumedMessages]
+			}
+			consumedMessagesMu.Unlock()
+
+			logger.Info("message consumed",
+				slog.String("queue", queueName),
+				slog.String("body", string(msg.Body)),
+			)
+		}
+	}
+}
+
+// RabbitMQPublishRequest is the request body for publishing a message
+type RabbitMQPublishRequest struct {
+	Message string `json:"message"`
+}
+
+// RabbitMQResponse is the response for RabbitMQ operations
+type RabbitMQResponse struct {
+	Success   bool               `json:"success"`
+	Message   string             `json:"message"`
+	TraceID   string             `json:"trace_id,omitempty"`
+	Consumed  []ConsumedMessage  `json:"consumed,omitempty"`
+	Connected bool               `json:"connected"`
+	Timestamp string             `json:"timestamp"`
+}
+
+// rabbitStatusHandler returns RabbitMQ connection status and consumed messages
+func rabbitStatusHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_, span := tracer.Start(ctx, "rabbitStatus")
+	defer span.End()
+
+	rabbitMu.RLock()
+	connected := rabbitEnabled && rabbitConn != nil && !rabbitConn.IsClosed()
+	rabbitMu.RUnlock()
+
+	consumedMessagesMu.RLock()
+	messages := make([]ConsumedMessage, len(consumedMessages))
+	copy(messages, consumedMessages)
+	consumedMessagesMu.RUnlock()
+
+	resp := RabbitMQResponse{
+		Success:   true,
+		Message:   "RabbitMQ status",
+		Connected: connected,
+		Consumed:  messages,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	logger.InfoContext(ctx, "rabbitmq status check",
+		slog.Bool("connected", connected),
+		slog.Int("consumed_messages", len(messages)),
+		slog.String("trace_id", span.SpanContext().TraceID().String()),
+	)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// rabbitPublishHandler publishes a message to RabbitMQ
+func rabbitPublishHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_, span := tracer.Start(ctx, "rabbitPublish")
+	defer span.End()
+
+	rabbitMu.RLock()
+	ch := rabbitChannel
+	enabled := rabbitEnabled
+	rabbitMu.RUnlock()
+
+	if !enabled || ch == nil {
+		resp := RabbitMQResponse{
+			Success:   false,
+			Message:   "RabbitMQ not connected",
+			Connected: false,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	// Get message from query param or body
+	message := r.URL.Query().Get("message")
+	if message == "" && r.Method == http.MethodPost {
+		var req RabbitMQPublishRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err == nil {
+			message = req.Message
+		}
+	}
+	if message == "" {
+		message = fmt.Sprintf("Hello from EpochCloud at %s", time.Now().Format(time.RFC3339))
+	}
+
+	queueName := os.Getenv("RABBITMQ_QUEUE")
+	if queueName == "" {
+		queueName = "epochcloud-demo"
+	}
+
+	traceID := span.SpanContext().TraceID().String()
+
+	err := ch.PublishWithContext(ctx,
+		"",        // exchange (default)
+		queueName, // routing key (queue name)
+		false,     // mandatory
+		false,     // immediate
+		amqp.Publishing{
+			ContentType: "text/plain",
+			Body:        []byte(message),
+			MessageId:   traceID, // Trace correlation
+			Timestamp:   time.Now(),
+		},
+	)
+
+	if err != nil {
+		rabbitPublishErrors.Inc()
+		logger.ErrorContext(ctx, "failed to publish message",
+			slog.String("queue", queueName),
+			slog.String("error", err.Error()),
+			slog.String("trace_id", traceID),
+		)
+		resp := RabbitMQResponse{
+			Success:   false,
+			Message:   "Failed to publish: " + err.Error(),
+			Connected: true,
+			TraceID:   traceID,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	rabbitMessagesPublished.Inc()
+	logger.InfoContext(ctx, "message published",
+		slog.String("queue", queueName),
+		slog.String("message", message),
+		slog.String("trace_id", traceID),
+	)
+
+	resp := RabbitMQResponse{
+		Success:   true,
+		Message:   fmt.Sprintf("Published to %s: %s", queueName, message),
+		Connected: true,
+		TraceID:   traceID,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// closeRabbitMQ closes RabbitMQ connections
+func closeRabbitMQ() {
+	rabbitMu.Lock()
+	defer rabbitMu.Unlock()
+
+	if rabbitChannel != nil {
+		rabbitChannel.Close()
+		rabbitChannel = nil
+	}
+	if rabbitConn != nil {
+		rabbitConn.Close()
+		rabbitConn = nil
+	}
+	rabbitEnabled = false
+	rabbitConnectionStatus.Set(0)
+	logger.Info("RabbitMQ connections closed")
+}
+
+// initValkey initializes the Valkey/Redis client
+func initValkey() {
+	host := os.Getenv("VALKEY_HOST")
+	port := os.Getenv("VALKEY_PORT")
+	password := os.Getenv("VALKEY_PASSWORD")
+	dbStr := os.Getenv("VALKEY_DATABASE")
+
+	if host == "" {
+		logger.Info("VALKEY_HOST not set, Valkey disabled")
+		return
+	}
+
+	db := 0
+	if dbStr != "" {
+		if parsed, err := strconv.Atoi(dbStr); err == nil {
+			db = parsed
+		}
+	}
+
+	if port == "" {
+		port = "6379"
+	}
+
+	addr := fmt.Sprintf("%s:%s", host, port)
+
+	client := redis.NewClient(&redis.Options{
+		Addr:     addr,
+		Password: password,
+		DB:       db,
+	})
+
+	// Retry connection with exponential backoff
+	// Valkey may not be ready immediately during pod startup
+	maxRetries := 5
+	backoff := time.Second
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := client.Ping(ctx).Err()
+		cancel()
+
+		if err == nil {
+			valkeyMu.Lock()
+			valkeyClient = client
+			valkeyEnabled = true
+			valkeyMu.Unlock()
+
+			valkeyConnectionStatus.Set(1)
+			logger.Info("Valkey connected",
+				slog.String("addr", addr),
+				slog.Int("db", db),
+			)
+			return
+		}
+
+		logger.Warn("failed to connect to Valkey, retrying",
+			slog.String("addr", addr),
+			slog.Int("db", db),
+			slog.Int("attempt", attempt),
+			slog.Int("max_retries", maxRetries),
+			slog.Duration("backoff", backoff),
+			slog.String("error", err.Error()),
+		)
+
+		if attempt < maxRetries {
+			time.Sleep(backoff)
+			backoff *= 2 // Exponential backoff
+		}
+	}
+
+	logger.Error("Valkey connection failed after all retries",
+		slog.String("addr", addr),
+		slog.Int("db", db),
+	)
+	valkeyConnectionStatus.Set(0)
+}
+
+// closeValkey closes the Valkey connection
+func closeValkey() {
+	valkeyMu.Lock()
+	defer valkeyMu.Unlock()
+
+	if valkeyClient != nil {
+		valkeyClient.Close()
+		valkeyClient = nil
+	}
+	valkeyEnabled = false
+	valkeyConnectionStatus.Set(0)
+	logger.Info("Valkey connection closed")
+}
+
+// ValkeyResponse for cache API responses
+type ValkeyResponse struct {
+	Success   bool   `json:"success"`
+	Operation string `json:"operation,omitempty"`
+	Key       string `json:"key,omitempty"`
+	Value     string `json:"value,omitempty"`
+	Hit       bool   `json:"hit,omitempty"`
+	Message   string `json:"message,omitempty"`
+	Connected bool   `json:"connected"`
+	TraceID   string `json:"trace_id,omitempty"`
+	Timestamp string `json:"timestamp"`
+}
+
+// valkeyStatusHandler returns Valkey connection status
+func valkeyStatusHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_, span := tracer.Start(ctx, "valkeyStatus")
+	defer span.End()
+
+	valkeyMu.RLock()
+	client := valkeyClient
+	enabled := valkeyEnabled
+	valkeyMu.RUnlock()
+
+	connected := false
+	if enabled && client != nil {
+		pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		if err := client.Ping(pingCtx).Err(); err == nil {
+			connected = true
+		}
+	}
+
+	if connected {
+		valkeyConnectionStatus.Set(1)
+	} else {
+		valkeyConnectionStatus.Set(0)
+	}
+
+	resp := ValkeyResponse{
+		Success:   connected,
+		Message:   fmt.Sprintf("Valkey enabled=%v, connected=%v", enabled, connected),
+		Connected: connected,
+		TraceID:   span.SpanContext().TraceID().String(),
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// valkeySetHandler sets a key-value pair in Valkey
+func valkeySetHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_, span := tracer.Start(ctx, "valkeySet")
+	defer span.End()
+
+	valkeyMu.RLock()
+	client := valkeyClient
+	enabled := valkeyEnabled
+	valkeyMu.RUnlock()
+
+	if !enabled || client == nil {
+		resp := ValkeyResponse{
+			Success:   false,
+			Message:   "Valkey not connected",
+			Connected: false,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	key := r.URL.Query().Get("key")
+	value := r.URL.Query().Get("value")
+	ttlStr := r.URL.Query().Get("ttl")
+
+	if key == "" {
+		key = "demo-key"
+	}
+	if value == "" {
+		value = fmt.Sprintf("demo-value-%d", time.Now().Unix())
+	}
+
+	ttl := 5 * time.Minute
+	if ttlStr != "" {
+		if seconds, err := strconv.Atoi(ttlStr); err == nil {
+			ttl = time.Duration(seconds) * time.Second
+		}
+	}
+
+	traceID := span.SpanContext().TraceID().String()
+
+	err := client.Set(ctx, key, value, ttl).Err()
+	if err != nil {
+		logger.ErrorContext(ctx, "failed to set key in Valkey",
+			slog.String("key", key),
+			slog.String("error", err.Error()),
+			slog.String("trace_id", traceID),
+		)
+		resp := ValkeyResponse{
+			Success:   false,
+			Operation: "SET",
+			Key:       key,
+			Message:   "Failed to set: " + err.Error(),
+			Connected: true,
+			TraceID:   traceID,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	valkeyOperations.WithLabelValues("set").Inc()
+	logger.InfoContext(ctx, "key set in Valkey",
+		slog.String("key", key),
+		slog.Duration("ttl", ttl),
+		slog.String("trace_id", traceID),
+	)
+
+	resp := ValkeyResponse{
+		Success:   true,
+		Operation: "SET",
+		Key:       key,
+		Value:     value,
+		Message:   fmt.Sprintf("Set key '%s' with TTL %v", key, ttl),
+		Connected: true,
+		TraceID:   traceID,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// valkeyGetHandler gets a value from Valkey
+func valkeyGetHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_, span := tracer.Start(ctx, "valkeyGet")
+	defer span.End()
+
+	valkeyMu.RLock()
+	client := valkeyClient
+	enabled := valkeyEnabled
+	valkeyMu.RUnlock()
+
+	if !enabled || client == nil {
+		resp := ValkeyResponse{
+			Success:   false,
+			Message:   "Valkey not connected",
+			Connected: false,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	key := r.URL.Query().Get("key")
+	if key == "" {
+		key = "demo-key"
+	}
+
+	traceID := span.SpanContext().TraceID().String()
+
+	value, err := client.Get(ctx, key).Result()
+	if err == redis.Nil {
+		// Cache miss
+		valkeyCacheMisses.Inc()
+		valkeyOperations.WithLabelValues("get").Inc()
+		logger.InfoContext(ctx, "cache miss",
+			slog.String("key", key),
+			slog.String("trace_id", traceID),
+		)
+		resp := ValkeyResponse{
+			Success:   true,
+			Operation: "GET",
+			Key:       key,
+			Hit:       false,
+			Message:   fmt.Sprintf("Key '%s' not found (cache miss)", key),
+			Connected: true,
+			TraceID:   traceID,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+		return
+	} else if err != nil {
+		logger.ErrorContext(ctx, "failed to get key from Valkey",
+			slog.String("key", key),
+			slog.String("error", err.Error()),
+			slog.String("trace_id", traceID),
+		)
+		resp := ValkeyResponse{
+			Success:   false,
+			Operation: "GET",
+			Key:       key,
+			Message:   "Failed to get: " + err.Error(),
+			Connected: true,
+			TraceID:   traceID,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	// Cache hit
+	valkeyCacheHits.Inc()
+	valkeyOperations.WithLabelValues("get").Inc()
+	logger.InfoContext(ctx, "cache hit",
+		slog.String("key", key),
+		slog.String("trace_id", traceID),
+	)
+
+	resp := ValkeyResponse{
+		Success:   true,
+		Operation: "GET",
+		Key:       key,
+		Value:     value,
+		Hit:       true,
+		Message:   fmt.Sprintf("Key '%s' found (cache hit)", key),
+		Connected: true,
+		TraceID:   traceID,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// DefectDojo API response types
+type DefectDojoProductsResponse struct {
+	Count   int                 `json:"count"`
+	Results []DefectDojoProduct `json:"results"`
+}
+
+type DefectDojoProduct struct {
+	ID          int    `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
+type DefectDojoFindingsResponse struct {
+	Count   int                  `json:"count"`
+	Results []DefectDojoFinding  `json:"results"`
+}
+
+type DefectDojoFinding struct {
+	ID       int    `json:"id"`
+	Title    string `json:"title"`
+	Severity string `json:"severity"`
+	Active   bool   `json:"active"`
+	Verified bool   `json:"verified"`
+}
+
+type DefectDojoFindingsSummary struct {
+	Total      int            `json:"total"`
+	BySeverity map[string]int `json:"by_severity"`
+}
+
+type DefectDojoStatusResponse struct {
+	Connected       bool                       `json:"connected"`
+	URL             string                     `json:"url,omitempty"`
+	Products        []DefectDojoProduct        `json:"products,omitempty"`
+	ProductCount    int                        `json:"product_count"`
+	FindingsSummary *DefectDojoFindingsSummary  `json:"findings_summary,omitempty"`
+	Message         string                     `json:"message"`
+	TraceID         string                     `json:"trace_id,omitempty"`
+	Timestamp       string                     `json:"timestamp"`
+}
+
+// initDefectDojo checks for DefectDojo configuration and verifies connectivity
+func initDefectDojo() {
+	defectdojoURL = os.Getenv("DEFECTDOJO_URL")
+	defectdojoToken = os.Getenv("DEFECTDOJO_TOKEN")
+
+	if defectdojoURL == "" || defectdojoToken == "" {
+		logger.Info("DefectDojo not configured, skipping initialization",
+			slog.Bool("url_set", defectdojoURL != ""),
+			slog.Bool("token_set", defectdojoToken != ""),
+		)
+		defectdojoConnectionStatus.Set(0)
+		return
+	}
+
+	// Verify connectivity with a lightweight API call
+	client := &http.Client{Timeout: 5 * time.Second}
+	req, err := http.NewRequest("GET", defectdojoURL+"/api/v2/products/?limit=1", nil)
+	if err != nil {
+		logger.Warn("DefectDojo request creation failed", slog.String("error", err.Error()))
+		defectdojoConnectionStatus.Set(0)
+		defectdojoEnabled = true // Enable anyway — will retry on request
+		return
+	}
+	req.Header.Set("Authorization", "Token "+defectdojoToken)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		logger.Warn("DefectDojo connectivity check failed, will retry on request",
+			slog.String("url", defectdojoURL),
+			slog.String("error", err.Error()),
+		)
+		defectdojoConnectionStatus.Set(0)
+		defectdojoEnabled = true
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 200 {
+		defectdojoEnabled = true
+		defectdojoConnectionStatus.Set(1)
+		logger.Info("DefectDojo connected", slog.String("url", defectdojoURL))
+	} else {
+		defectdojoEnabled = true
+		defectdojoConnectionStatus.Set(0)
+		logger.Warn("DefectDojo returned non-200",
+			slog.String("url", defectdojoURL),
+			slog.Int("status", resp.StatusCode),
+		)
+	}
+}
+
+// defectdojoAPIGet makes an authenticated GET request to the DefectDojo API
+func defectdojoAPIGet(ctx context.Context, client *http.Client, path string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", defectdojoURL+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Token "+defectdojoToken)
+	req.Header.Set("Accept", "application/json")
+	return client.Do(req)
+}
+
+// defectdojoStatusHandler returns DefectDojo connection status, products, and findings summary
+func defectdojoStatusHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_, span := tracer.Start(ctx, "defectdojoStatus")
+	defer span.End()
+
+	traceID := span.SpanContext().TraceID().String()
+
+	if !defectdojoEnabled {
+		resp := DefectDojoStatusResponse{
+			Connected: false,
+			Message:   "DefectDojo not configured (DEFECTDOJO_URL or DEFECTDOJO_TOKEN not set)",
+			TraceID:   traceID,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	// Fetch products
+	prodResp, err := defectdojoAPIGet(ctx, client, "/api/v2/products/?limit=50")
+	if err != nil {
+		defectdojoConnectionStatus.Set(0)
+		defectdojoAPIRequests.WithLabelValues("products", "error").Inc()
+		logger.ErrorContext(ctx, "DefectDojo products request failed",
+			slog.String("error", err.Error()),
+			slog.String("trace_id", traceID),
+		)
+		resp := DefectDojoStatusResponse{
+			Connected: false,
+			URL:       defectdojoURL,
+			Message:   "Failed to connect: " + err.Error(),
+			TraceID:   traceID,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+	defer prodResp.Body.Close()
+
+	if prodResp.StatusCode != 200 {
+		defectdojoConnectionStatus.Set(0)
+		defectdojoAPIRequests.WithLabelValues("products", "error").Inc()
+		resp := DefectDojoStatusResponse{
+			Connected: false,
+			URL:       defectdojoURL,
+			Message:   fmt.Sprintf("DefectDojo API returned %d", prodResp.StatusCode),
+			TraceID:   traceID,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	var products DefectDojoProductsResponse
+	if err := json.NewDecoder(prodResp.Body).Decode(&products); err != nil {
+		defectdojoAPIRequests.WithLabelValues("products", "error").Inc()
+		resp := DefectDojoStatusResponse{
+			Connected: false,
+			URL:       defectdojoURL,
+			Message:   "Failed to decode products: " + err.Error(),
+			TraceID:   traceID,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+	defectdojoAPIRequests.WithLabelValues("products", "success").Inc()
+
+	// Fetch active findings summary
+	var summary *DefectDojoFindingsSummary
+	findResp, err := defectdojoAPIGet(ctx, client, "/api/v2/findings/?active=true&limit=100")
+	if err == nil {
+		defer findResp.Body.Close()
+		if findResp.StatusCode == 200 {
+			var findings DefectDojoFindingsResponse
+			if err := json.NewDecoder(findResp.Body).Decode(&findings); err == nil {
+				defectdojoAPIRequests.WithLabelValues("findings", "success").Inc()
+				bySeverity := make(map[string]int)
+				for _, f := range findings.Results {
+					bySeverity[f.Severity]++
+				}
+				summary = &DefectDojoFindingsSummary{
+					Total:      findings.Count,
+					BySeverity: bySeverity,
+				}
+			}
+		}
+	}
+	if summary == nil {
+		defectdojoAPIRequests.WithLabelValues("findings", "error").Inc()
+	}
+
+	defectdojoConnectionStatus.Set(1)
+
+	logger.InfoContext(ctx, "DefectDojo status check",
+		slog.Int("products", products.Count),
+		slog.String("trace_id", traceID),
+	)
+
+	statusResp := DefectDojoStatusResponse{
+		Connected:       true,
+		URL:             defectdojoURL,
+		Products:        products.Results,
+		ProductCount:    products.Count,
+		FindingsSummary: summary,
+		Message:         "DefectDojo connected",
+		TraceID:         traceID,
+		Timestamp:       time.Now().UTC().Format(time.RFC3339),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(statusResp)
+}
+
+// EmailResponse contains the result of an email send operation
+type EmailResponse struct {
+	Success   bool   `json:"success"`
+	Message   string `json:"message"`
+	Recipient string `json:"recipient,omitempty"`
+	Timestamp string `json:"timestamp"`
+}
+
+// emailSendHandler sends a demo email via Maddy SMTP relay
+func emailSendHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_, span := tracer.Start(ctx, "sendEmail")
+	defer span.End()
+
+	w.Header().Set("Content-Type", "application/json")
+
+	if !smtpEnabled {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(EmailResponse{
+			Success:   false,
+			Message:   "Email not configured (SMTP_HOST not set)",
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+
+	// Get recipient email from query param or POST form
+	var recipient string
+	if r.Method == http.MethodPost {
+		r.ParseForm()
+		recipient = r.FormValue("email")
+	} else {
+		recipient = r.URL.Query().Get("email")
+	}
+
+	if recipient == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(EmailResponse{
+			Success:   false,
+			Message:   "Missing 'email' parameter",
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+
+	// Build the email
+	hostname, _ := os.Hostname()
+	subject := "Hello from EpochCloud!"
+	body := fmt.Sprintf("Hello!\n\nThis email was sent from the EpochCloud test application to demonstrate the full email pipeline:\n\n  App Pod (%s) -> Maddy SMTP Relay -> Resend API -> Your Inbox\n\nStack: Go net/smtp -> Maddy (internal relay) -> Resend (transactional email) -> Cloudflare DNS (DKIM/SPF)\n\nVersion: %s\nEnvironment: %s\nTimestamp: %s\n\n-- EpochCloud\n",
+		hostname, Version, getEnvironment(), time.Now().UTC().Format(time.RFC3339))
+
+	msg := fmt.Sprintf("From: EpochCloud <%s>\r\nTo: %s\r\nSubject: %s\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n%s",
+		smtpFrom, recipient, subject, body)
+
+	// Send via Maddy (no auth needed for internal relay)
+	addr := net.JoinHostPort(smtpHost, smtpPort)
+	err := smtp.SendMail(addr, nil, smtpFrom, []string{recipient}, []byte(msg))
+	if err != nil {
+		emailErrors.Inc()
+		logger.ErrorContext(ctx, "email send failed",
+			slog.String("recipient", recipient),
+			slog.String("error", err.Error()),
+			slog.String("trace_id", span.SpanContext().TraceID().String()),
+		)
+		span.RecordError(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(EmailResponse{
+			Success:   false,
+			Message:   fmt.Sprintf("Failed to send email: %s", err.Error()),
+			Recipient: recipient,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+
+	emailsSentTotal.Inc()
+	logger.InfoContext(ctx, "email sent",
+		slog.String("recipient", recipient),
+		slog.String("from", smtpFrom),
+		slog.String("trace_id", span.SpanContext().TraceID().String()),
+	)
+
+	json.NewEncoder(w).Encode(EmailResponse{
+		Success:   true,
+		Message:   "Email sent successfully! Check your inbox.",
+		Recipient: recipient,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// BetterAuth integration handlers
+// These demonstrate how a Go service validates sessions and proxies
+// auth requests to the centralized BetterAuth server.
+
+// AuthStatusResponse contains BetterAuth server connectivity info
+type AuthStatusResponse struct {
+	Connected bool   `json:"connected"`
+	URL       string `json:"url"`
+	Health    string `json:"health,omitempty"`
+	Error     string `json:"error,omitempty"`
+	Timestamp string `json:"timestamp"`
+}
+
+// authStatusHandler checks BetterAuth server health
+func authStatusHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_, span := tracer.Start(ctx, "authStatus")
+	defer span.End()
+
+	resp := AuthStatusResponse{
+		URL:       betterAuthURL,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	if !betterAuthEnabled {
+		resp.Error = "BetterAuth not configured (BETTERAUTH_URL not set)"
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	healthResp, err := client.Get(betterAuthURL + "/health")
+	if err != nil {
+		resp.Error = fmt.Sprintf("Connection failed: %s", err.Error())
+		logger.WarnContext(ctx, "betterauth health check failed",
+			slog.String("error", err.Error()),
+			slog.String("trace_id", span.SpanContext().TraceID().String()),
+		)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+	defer healthResp.Body.Close()
+
+	var healthBody map[string]interface{}
+	json.NewDecoder(healthResp.Body).Decode(&healthBody)
+
+	resp.Connected = healthResp.StatusCode == 200
+	if status, ok := healthBody["status"].(string); ok {
+		resp.Health = status
+	}
+	if version, ok := healthBody["version"].(string); ok {
+		resp.Health += " (v" + version + ")"
+	}
+
+	logger.InfoContext(ctx, "betterauth health check",
+		slog.Bool("connected", resp.Connected),
+		slog.String("trace_id", span.SpanContext().TraceID().String()),
+	)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// AuthActionResponse contains the result of a BetterAuth API call
+type AuthActionResponse struct {
+	Success   bool        `json:"success"`
+	Action    string      `json:"action"`
+	Message   string      `json:"message"`
+	Data      interface{} `json:"data,omitempty"`
+	Timestamp string      `json:"timestamp"`
+}
+
+// authRegisterHandler proxies a registration request to BetterAuth
+// POST /auth/register with JSON body: {"email": "...", "password": "...", "name": "..."}
+func authRegisterHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_, span := tracer.Start(ctx, "authRegister")
+	defer span.End()
+
+	if r.Method != http.MethodPost {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		json.NewEncoder(w).Encode(AuthActionResponse{
+			Action:    "register",
+			Message:   "Use POST with JSON body: {\"email\": \"...\", \"password\": \"...\", \"name\": \"...\"}",
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+
+	if !betterAuthEnabled {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(AuthActionResponse{
+			Action:    "register",
+			Message:   "BetterAuth not configured",
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+
+	// Forward the request body to BetterAuth
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		betterAuthURL+"/api/auth/sign-up/email", r.Body)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(AuthActionResponse{
+			Action:    "register",
+			Message:   fmt.Sprintf("Failed to create request: %s", err.Error()),
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(AuthActionResponse{
+			Action:    "register",
+			Message:   fmt.Sprintf("BetterAuth request failed: %s", err.Error()),
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+	defer resp.Body.Close()
+
+	var body map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&body)
+
+	success := resp.StatusCode >= 200 && resp.StatusCode < 300
+
+	logger.InfoContext(ctx, "betterauth registration attempt",
+		slog.Bool("success", success),
+		slog.Int("status_code", resp.StatusCode),
+		slog.String("trace_id", span.SpanContext().TraceID().String()),
+	)
+
+	w.Header().Set("Content-Type", "application/json")
+	if !success {
+		w.WriteHeader(resp.StatusCode)
+	}
+	json.NewEncoder(w).Encode(AuthActionResponse{
+		Success:   success,
+		Action:    "register",
+		Message:   fmt.Sprintf("Registration %s (HTTP %d)", map[bool]string{true: "successful", false: "failed"}[success], resp.StatusCode),
+		Data:      body,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// authLoginHandler proxies a login request to BetterAuth
+// POST /auth/login with JSON body: {"email": "...", "password": "..."}
+func authLoginHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_, span := tracer.Start(ctx, "authLogin")
+	defer span.End()
+
+	if r.Method != http.MethodPost {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		json.NewEncoder(w).Encode(AuthActionResponse{
+			Action:    "login",
+			Message:   "Use POST with JSON body: {\"email\": \"...\", \"password\": \"...\"}",
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+
+	if !betterAuthEnabled {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(AuthActionResponse{
+			Action:    "login",
+			Message:   "BetterAuth not configured",
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		betterAuthURL+"/api/auth/sign-in/email", r.Body)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(AuthActionResponse{
+			Action:    "login",
+			Message:   fmt.Sprintf("Failed to create request: %s", err.Error()),
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(AuthActionResponse{
+			Action:    "login",
+			Message:   fmt.Sprintf("BetterAuth request failed: %s", err.Error()),
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+	defer resp.Body.Close()
+
+	var body map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&body)
+
+	success := resp.StatusCode >= 200 && resp.StatusCode < 300
+
+	logger.InfoContext(ctx, "betterauth login attempt",
+		slog.Bool("success", success),
+		slog.Int("status_code", resp.StatusCode),
+		slog.String("trace_id", span.SpanContext().TraceID().String()),
+	)
+
+	w.Header().Set("Content-Type", "application/json")
+	if !success {
+		w.WriteHeader(resp.StatusCode)
+	}
+	json.NewEncoder(w).Encode(AuthActionResponse{
+		Success:   success,
+		Action:    "login",
+		Message:   fmt.Sprintf("Login %s (HTTP %d)", map[bool]string{true: "successful", false: "failed"}[success], resp.StatusCode),
+		Data:      body,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// authSessionHandler validates a session by forwarding cookies to BetterAuth
+// GET /auth/session — forwards the request cookies to BetterAuth's get-session endpoint
+func authSessionHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_, span := tracer.Start(ctx, "authSession")
+	defer span.End()
+
+	if !betterAuthEnabled {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(AuthActionResponse{
+			Action:    "session",
+			Message:   "BetterAuth not configured",
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		betterAuthURL+"/api/auth/get-session", nil)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(AuthActionResponse{
+			Action:    "session",
+			Message:   fmt.Sprintf("Failed to create request: %s", err.Error()),
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+
+	// Forward all cookies from the incoming request
+	for _, cookie := range r.Cookies() {
+		req.AddCookie(cookie)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(AuthActionResponse{
+			Action:    "session",
+			Message:   fmt.Sprintf("BetterAuth request failed: %s", err.Error()),
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+	defer resp.Body.Close()
+
+	var body map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&body)
+
+	hasSession := resp.StatusCode == 200 && body != nil
+
+	logger.InfoContext(ctx, "betterauth session check",
+		slog.Bool("has_session", hasSession),
+		slog.Int("status_code", resp.StatusCode),
+		slog.String("trace_id", span.SpanContext().TraceID().String()),
+	)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(AuthActionResponse{
+		Success:   hasSession,
+		Action:    "session",
+		Message:   map[bool]string{true: "Active session found", false: "No active session"}[hasSession],
+		Data:      body,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// GO Feature Flag integration handlers
+// These demonstrate how a Go service evaluates feature flags via the
+// GO Feature Flag relay proxy REST API.
+
+// FeatureFlagStatusResponse contains relay proxy connectivity info
+type FeatureFlagStatusResponse struct {
+	Connected      bool   `json:"connected"`
+	URL            string `json:"url"`
+	FlagsAvailable int    `json:"flags_available,omitempty"`
+	Error          string `json:"error,omitempty"`
+	Timestamp      string `json:"timestamp"`
+}
+
+// FeatureFlagEvalResponse contains a single flag evaluation result
+type FeatureFlagEvalResponse struct {
+	Flag          string      `json:"flag"`
+	Value         interface{} `json:"value"`
+	VariationType string      `json:"variationType,omitempty"`
+	Reason        string      `json:"reason,omitempty"`
+	Failed        bool        `json:"failed,omitempty"`
+	Error         string      `json:"error,omitempty"`
+	Timestamp     string      `json:"timestamp"`
+}
+
+// featureFlagStatusHandler checks relay proxy health and flag availability
+func featureFlagStatusHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_, span := tracer.Start(ctx, "featureFlagStatus")
+	defer span.End()
+
+	resp := FeatureFlagStatusResponse{
+		URL:       goFeatureFlagURL,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	if !goFeatureFlagEnabled {
+		resp.Error = "GO Feature Flag not configured (GOFEATUREFLAG_URL not set)"
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	// Evaluate all flags to check connectivity and count available flags
+	evalCtx := map[string]interface{}{
+		"evaluationContext": map[string]interface{}{
+			"targetingKey": "health-check",
+		},
+	}
+	body, _ := json.Marshal(evalCtx)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	evalResp, err := client.Post(goFeatureFlagURL+"/v1/allflags", "application/json", bytes.NewReader(body))
+	if err != nil {
+		resp.Error = fmt.Sprintf("Connection failed: %s", err.Error())
+		logger.WarnContext(ctx, "gofeatureflag health check failed",
+			slog.String("error", err.Error()),
+			slog.String("trace_id", span.SpanContext().TraceID().String()),
+		)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+	defer evalResp.Body.Close()
+
+	var allFlags map[string]interface{}
+	json.NewDecoder(evalResp.Body).Decode(&allFlags)
+
+	resp.Connected = evalResp.StatusCode == 200
+	if flags, ok := allFlags["flags"].(map[string]interface{}); ok {
+		resp.FlagsAvailable = len(flags)
+	} else {
+		// Top-level keys are flag names
+		resp.FlagsAvailable = len(allFlags)
+	}
+
+	logger.InfoContext(ctx, "gofeatureflag health check",
+		slog.Bool("connected", resp.Connected),
+		slog.Int("flags", resp.FlagsAvailable),
+		slog.String("trace_id", span.SpanContext().TraceID().String()),
+	)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// featureFlagEvaluateHandler evaluates a single feature flag
+// GET /features/evaluate?flag=<name>&user=<id>
+func featureFlagEvaluateHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_, span := tracer.Start(ctx, "featureFlagEvaluate")
+	defer span.End()
+
+	flagName := r.URL.Query().Get("flag")
+	userID := r.URL.Query().Get("user")
+	if flagName == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(FeatureFlagEvalResponse{
+			Error:     "Missing 'flag' query parameter",
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+	if userID == "" {
+		userID = "anonymous"
+	}
+
+	if !goFeatureFlagEnabled {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(FeatureFlagEvalResponse{
+			Flag:      flagName,
+			Error:     "GO Feature Flag not configured",
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+
+	evalCtx := map[string]interface{}{
+		"evaluationContext": map[string]interface{}{
+			"targetingKey": userID,
+			"environment":  getEnvironment(),
+		},
+		"defaultValue": false,
+	}
+	body, _ := json.Marshal(evalCtx)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	evalResp, err := client.Post(
+		goFeatureFlagURL+"/v1/feature/"+flagName+"/eval",
+		"application/json",
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		featureFlagErrors.Inc()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(FeatureFlagEvalResponse{
+			Flag:      flagName,
+			Error:     fmt.Sprintf("Relay proxy request failed: %s", err.Error()),
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+	defer evalResp.Body.Close()
+
+	var result map[string]interface{}
+	json.NewDecoder(evalResp.Body).Decode(&result)
+
+	value := result["value"]
+	variationType, _ := result["variationType"].(string)
+	reason, _ := result["reason"].(string)
+	failed, _ := result["failed"].(bool)
+
+	if failed {
+		featureFlagErrors.Inc()
+	}
+	featureFlagEvaluations.WithLabelValues(flagName, fmt.Sprintf("%v", value)).Inc()
+
+	logger.InfoContext(ctx, "feature flag evaluated",
+		slog.String("flag", flagName),
+		slog.String("user", userID),
+		slog.Any("value", value),
+		slog.String("variation", variationType),
+		slog.String("reason", reason),
+		slog.String("trace_id", span.SpanContext().TraceID().String()),
+	)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(FeatureFlagEvalResponse{
+		Flag:          flagName,
+		Value:         value,
+		VariationType: variationType,
+		Reason:        reason,
+		Failed:        failed,
+		Timestamp:     time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// featureFlagAllHandler evaluates all feature flags for a user
+// GET /features/all?user=<id>
+func featureFlagAllHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_, span := tracer.Start(ctx, "featureFlagAll")
+	defer span.End()
+
+	userID := r.URL.Query().Get("user")
+	if userID == "" {
+		userID = "anonymous"
+	}
+
+	if !goFeatureFlagEnabled {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error":     "GO Feature Flag not configured",
+			"timestamp": time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+
+	evalCtx := map[string]interface{}{
+		"evaluationContext": map[string]interface{}{
+			"targetingKey": userID,
+			"environment":  getEnvironment(),
+		},
+	}
+	body, _ := json.Marshal(evalCtx)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	evalResp, err := client.Post(goFeatureFlagURL+"/v1/allflags", "application/json", bytes.NewReader(body))
+	if err != nil {
+		featureFlagErrors.Inc()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error":     fmt.Sprintf("Relay proxy request failed: %s", err.Error()),
+			"timestamp": time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+	defer evalResp.Body.Close()
+
+	var allFlags map[string]interface{}
+	json.NewDecoder(evalResp.Body).Decode(&allFlags)
+
+	logger.InfoContext(ctx, "all feature flags evaluated",
+		slog.String("user", userID),
+		slog.Int("flag_count", len(allFlags)),
+		slog.String("trace_id", span.SpanContext().TraceID().String()),
+	)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(allFlags)
+}
+
 func main() {
 	initLogger()
+
+	// Check if running in consumer-only mode (for KEDA scaling)
+	consumerMode = os.Getenv("CONSUMER_MODE") == "true"
+	if consumerMode {
+		logger.Info("starting in CONSUMER mode - HTTP server disabled, consuming only")
+	}
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -572,14 +2640,95 @@ func main() {
 		}()
 	}
 
+	// Start RabbitMQ connection manager (non-blocking, handles retries internally)
+	initRabbitMQ(ctx)
+	defer closeRabbitMQ()
+
+	// Initialize Valkey/Redis connection
+	initValkey()
+	defer closeValkey()
+
+	// Initialize DefectDojo API client
+	initDefectDojo()
+
+	// Initialize Rybbit analytics config
+	rybbitSiteID = os.Getenv("RYBBIT_SITE_ID")
+	rybbitHost = os.Getenv("RYBBIT_HOST")
+
+	// Initialize SMTP/Email config
+	smtpHost = os.Getenv("SMTP_HOST")
+	smtpPort = os.Getenv("SMTP_PORT")
+	if smtpPort == "" {
+		smtpPort = "587"
+	}
+	smtpFrom = os.Getenv("SMTP_FROM")
+	if smtpFrom == "" {
+		smtpFrom = "noreply@epoch.engineering"
+	}
+	smtpEnabled = smtpHost != ""
+	if smtpEnabled {
+		logger.Info("SMTP email enabled",
+			slog.String("host", smtpHost),
+			slog.String("port", smtpPort),
+			slog.String("from", smtpFrom),
+		)
+	} else {
+		logger.Info("SMTP email disabled (SMTP_HOST not set)")
+	}
+
+	// Initialize BetterAuth config
+	betterAuthURL = os.Getenv("BETTERAUTH_URL")
+	if betterAuthURL == "" {
+		betterAuthURL = "http://betterauth.betterauth.svc.cluster.local:3000"
+	}
+	betterAuthEnabled = betterAuthURL != ""
+	if betterAuthEnabled {
+		logger.Info("BetterAuth enabled", slog.String("url", betterAuthURL))
+	}
+
+	// Initialize GO Feature Flag relay proxy config
+	goFeatureFlagURL = os.Getenv("GOFEATUREFLAG_URL")
+	if goFeatureFlagURL == "" {
+		goFeatureFlagURL = "http://relay-proxy.gofeatureflag.svc.cluster.local:1031"
+	}
+	goFeatureFlagEnabled = goFeatureFlagURL != ""
+	if goFeatureFlagEnabled {
+		logger.Info("GO Feature Flag enabled", slog.String("url", goFeatureFlagURL))
+	}
+
 	appInfo.WithLabelValues(Version, Commit, BuildTime, getEnvironment()).Set(1)
 
 	mux := http.NewServeMux()
-	mux.Handle("/", metricsMiddleware("/", rootHandler))
+	// Always register health and metrics for probes and monitoring
 	mux.Handle("/health", metricsMiddleware("/health", healthHandler))
-	mux.Handle("/version", metricsMiddleware("/version", versionHandler))
-	mux.Handle("/chaos", metricsMiddleware("/chaos", chaosHandler))
 	mux.Handle("/metrics", promhttp.Handler())
+
+	if !consumerMode {
+		// Full HTTP API only in producer mode
+		mux.Handle("/", metricsMiddleware("/", rootHandler))
+		mux.Handle("/version", metricsMiddleware("/version", versionHandler))
+		mux.Handle("/chaos", metricsMiddleware("/chaos", chaosHandler))
+		// RabbitMQ demo endpoints
+		mux.Handle("/rabbitmq/status", metricsMiddleware("/rabbitmq/status", rabbitStatusHandler))
+		mux.Handle("/rabbitmq/publish", metricsMiddleware("/rabbitmq/publish", rabbitPublishHandler))
+		// Valkey/Redis cache demo endpoints
+		mux.Handle("/cache/status", metricsMiddleware("/cache/status", valkeyStatusHandler))
+		mux.Handle("/cache/set", metricsMiddleware("/cache/set", valkeySetHandler))
+		mux.Handle("/cache/get", metricsMiddleware("/cache/get", valkeyGetHandler))
+		// DefectDojo security demo endpoint
+		mux.Handle("/defectdojo/status", metricsMiddleware("/defectdojo/status", defectdojoStatusHandler))
+		// Email demo endpoint
+		mux.Handle("/email/send", metricsMiddleware("/email/send", emailSendHandler))
+		// BetterAuth demo endpoints
+		mux.Handle("/auth/status", metricsMiddleware("/auth/status", authStatusHandler))
+		mux.Handle("/auth/register", metricsMiddleware("/auth/register", authRegisterHandler))
+		mux.Handle("/auth/login", metricsMiddleware("/auth/login", authLoginHandler))
+		mux.Handle("/auth/session", metricsMiddleware("/auth/session", authSessionHandler))
+		// GO Feature Flag demo endpoints
+		mux.Handle("/features/status", metricsMiddleware("/features/status", featureFlagStatusHandler))
+		mux.Handle("/features/evaluate", metricsMiddleware("/features/evaluate", featureFlagEvaluateHandler))
+		mux.Handle("/features/all", metricsMiddleware("/features/all", featureFlagAllHandler))
+	}
 
 	server := &http.Server{
 		Addr:         ":" + port,
@@ -593,6 +2742,7 @@ func main() {
 		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 		<-sigChan
 		logger.Info("shutting down")
+		cancel() // Cancel context to stop RabbitMQ consumer
 		shutdownCtx, c := context.WithTimeout(context.Background(), 30*time.Second)
 		defer c()
 		server.Shutdown(shutdownCtx)
@@ -604,21 +2754,3 @@ func main() {
 		os.Exit(1)
 	}
 }
-// test 1767625973
-// test2 1767626122
-// test3 1767626184
-// test1 1767626512
-// test2 1767626520
-// test3 1767626529
-// test-terminate1 1767626716
-// test-terminate2 1767626726
-// final-test1 1767626992
-// final-test2 1767627002
-// cancel test 1767634496
-// Test cancel-in-progress status fix 1767637323
-// Test cancel-in-progress status fix 1767637327
-// Trigger cancel 1767637344
-// Test timestamp fix 1767637721
-// Trigger cancel test 1767637774
-// Final test 1767639503
-// Cancel test 1767639554
